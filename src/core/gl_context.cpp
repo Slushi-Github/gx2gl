@@ -16,6 +16,95 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef GL_OBJECT_TYPE
+#define GL_OBJECT_TYPE 0x9112
+#endif
+#ifndef GL_SYNC_CONDITION
+#define GL_SYNC_CONDITION 0x9113
+#endif
+#ifndef GL_SYNC_STATUS
+#define GL_SYNC_STATUS 0x9114
+#endif
+#ifndef GL_SYNC_FLAGS
+#define GL_SYNC_FLAGS 0x9115
+#endif
+#ifndef GL_SYNC_FENCE
+#define GL_SYNC_FENCE 0x9116
+#endif
+#ifndef GL_WAIT_FAILED
+#ifdef GL_WAIT_FAILED_GL
+#define GL_WAIT_FAILED GL_WAIT_FAILED_GL
+#else
+#define GL_WAIT_FAILED 0x911D
+#endif
+#endif
+#ifndef GL_SAMPLE_POSITION
+#define GL_SAMPLE_POSITION 0x8E50
+#endif
+#ifndef GL_TEXTURE_2D_MULTISAMPLE
+#define GL_TEXTURE_2D_MULTISAMPLE 0x9100
+#endif
+#ifndef GL_PROXY_TEXTURE_2D_MULTISAMPLE
+#define GL_PROXY_TEXTURE_2D_MULTISAMPLE 0x9101
+#endif
+#ifndef GL_TEXTURE_2D_MULTISAMPLE_ARRAY
+#define GL_TEXTURE_2D_MULTISAMPLE_ARRAY 0x9102
+#endif
+#ifndef GL_PROXY_TEXTURE_2D_MULTISAMPLE_ARRAY
+#define GL_PROXY_TEXTURE_2D_MULTISAMPLE_ARRAY 0x9103
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+#endif
+#ifndef GL_POINT_SIZE_MIN
+#define GL_POINT_SIZE_MIN 0x8126
+#endif
+#ifndef GL_POINT_SIZE_MAX
+#define GL_POINT_SIZE_MAX 0x8127
+#endif
+#ifndef GL_POINT_FADE_THRESHOLD_SIZE
+#define GL_POINT_FADE_THRESHOLD_SIZE 0x8128
+#endif
+#ifndef GL_POINT_DISTANCE_ATTENUATION
+#define GL_POINT_DISTANCE_ATTENUATION 0x8129
+#endif
+#ifndef GL_TRANSFORM_FEEDBACK
+#define GL_TRANSFORM_FEEDBACK 0x8E22
+#endif
+#ifndef GL_INTERLEAVED_ATTRIBS
+#define GL_INTERLEAVED_ATTRIBS 0x8C8C
+#endif
+#ifndef GL_SEPARATE_ATTRIBS
+#define GL_SEPARATE_ATTRIBS 0x8C8D
+#endif
+#ifndef GL_CLAMP_VERTEX_COLOR
+#define GL_CLAMP_VERTEX_COLOR 0x891A
+#endif
+#ifndef GL_CLAMP_FRAGMENT_COLOR
+#define GL_CLAMP_FRAGMENT_COLOR 0x891B
+#endif
+#ifndef GL_CLAMP_READ_COLOR
+#define GL_CLAMP_READ_COLOR 0x891C
+#endif
+#ifndef GL_FIXED_ONLY
+#define GL_FIXED_ONLY 0x891D
+#endif
+#ifndef GL_FIRST_VERTEX_CONVENTION
+#define GL_FIRST_VERTEX_CONVENTION 0x8E4D
+#endif
+#ifndef GL_LAST_VERTEX_CONVENTION
+#define GL_LAST_VERTEX_CONVENTION 0x8E4E
+#endif
+#ifndef GL_TEXTURE_CUBE_MAP_POSITIVE_X
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_X 0x8515
+#endif
+#ifndef GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
+#define GL_TEXTURE_CUBE_MAP_NEGATIVE_Z 0x851A
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -57,6 +146,10 @@ static void gl_context_init_defaults(gl_context_t *ctx) {
   ctx->line_width = 1.0f;
   ctx->logic_op = GL_COPY;
   ctx->point_size = 1.0f;
+  ctx->color_mask[0] = GL_TRUE;
+  ctx->color_mask[1] = GL_TRUE;
+  ctx->color_mask[2] = GL_TRUE;
+  ctx->color_mask[3] = GL_TRUE;
   for (uint32_t i = 0; i < GL33_MAX_VERTEX_ATTRIBS; ++i) ctx->current_vertex_attrib[i][3] = 1.0f;
   ctx->clear_depth = 1.0f;
   ctx->sample_coverage_value = 1.0f;
@@ -600,46 +693,135 @@ void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count, GLenum typ
 
 
 void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value) {
-    if (!g_gl_context) return;
-    gl_flush_state();
+    if (!g_gl_context || !value) return;
     if (buffer == GL_STENCIL) {
+        if (drawbuffer != 0) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        gl_flush_state();
         GX2DepthBuffer *db = gl_get_draw_depth_buffer();
         if (db) GX2ClearDepthStencilEx(db, db->depthClear, (uint8_t)value[0], GX2_CLEAR_FLAGS_STENCIL);
+        return;
     }
-}
-void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) { (void)buffer; (void)drawbuffer; (void)value; }
-void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) {
-    if (!g_gl_context) return;
-    gl_flush_state();
     if (buffer == GL_COLOR) {
+        if (drawbuffer < 0 || drawbuffer >= 8 ||
+            (g_gl_context->bound_framebuffer == 0 && drawbuffer != 0)) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        /* gx2gl does not currently expose integer-format color clears. */
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    _gl_set_error(GL_INVALID_ENUM);
+}
+void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) {
+    if (!g_gl_context || !value) return;
+    if (buffer == GL_COLOR) {
+        if (drawbuffer < 0 || drawbuffer >= 8 ||
+            (g_gl_context->bound_framebuffer == 0 && drawbuffer != 0)) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        /* gx2gl does not currently expose unsigned-integer color clears. */
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    _gl_set_error(GL_INVALID_ENUM);
+}
+void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) {
+    if (!g_gl_context || !value) return;
+    if (buffer == GL_COLOR) {
+        if (drawbuffer < 0 || drawbuffer >= 8 ||
+            (g_gl_context->bound_framebuffer == 0 && drawbuffer != 0)) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        gl_flush_state();
         GX2ColorBuffer *cb = gl_get_draw_color_buffer((GLuint)drawbuffer);
-        if (cb) GX2ClearColor(cb, value[0], value[1], value[2], value[3]);
+        if (cb) {
+            GX2ClearColor(cb, value[0], value[1], value[2], value[3]);
+            gl_framebuffer_mark_bound_color_buffer_dirty((GLuint)drawbuffer);
+        }
     } else if (buffer == GL_DEPTH) {
+        if (drawbuffer != 0) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        gl_flush_state();
         GX2DepthBuffer *db = gl_get_draw_depth_buffer();
         if (db) GX2ClearDepthStencilEx(db, value[0], (uint8_t)db->stencilClear, GX2_CLEAR_FLAGS_DEPTH);
+    } else {
+        _gl_set_error(GL_INVALID_ENUM);
     }
 }
 void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
-    (void)buffer; (void)drawbuffer;
     if (!g_gl_context) return;
+    if (buffer != GL_DEPTH_STENCIL) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (drawbuffer != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
     gl_flush_state();
     GX2DepthBuffer *db = gl_get_draw_depth_buffer();
     if (db) GX2ClearDepthStencilEx(db, depth, (uint8_t)stencil, GX2_CLEAR_FLAGS_BOTH);
 }
 
 
-void glEnablei(GLenum cap, GLuint index) { (void)index; glEnable(cap); }
-void glDisablei(GLenum cap, GLuint index) { (void)index; glDisable(cap); }
-GLboolean glIsEnabledi(GLenum cap, GLuint index) { (void)index; return glIsEnabled(cap); }
-void glColorMaski(GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a) { (void)index; glColorMask(r,g,b,a); }
+void glEnablei(GLenum cap, GLuint index) {
+    if (index != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (cap != GL_BLEND && cap != GL_SCISSOR_TEST) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    glEnable(cap);
+}
+void glDisablei(GLenum cap, GLuint index) {
+    if (index != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (cap != GL_BLEND && cap != GL_SCISSOR_TEST) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    glDisable(cap);
+}
+GLboolean glIsEnabledi(GLenum cap, GLuint index) {
+    if (index != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return GL_FALSE;
+    }
+    if (cap != GL_BLEND && cap != GL_SCISSOR_TEST) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return GL_FALSE;
+    }
+    return glIsEnabled(cap);
+}
+void glColorMaski(GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+    if (index != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    glColorMask(r, g, b, a);
+}
 
 
 void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
     if (!g_gl_context || !data) return;
     if (target == GL_UNIFORM_BUFFER_BINDING && index < GL33_MAX_UNIFORM_BUFFER_BINDINGS)
         *data = (GLint)g_gl_context->uniform_buffer_bindings[index].buffer;
+    else if (target == GL_UNIFORM_BUFFER_BINDING)
+        _gl_set_error(GL_INVALID_VALUE);
     else
-        *data = 0;
+        _gl_set_error(GL_INVALID_ENUM);
 }
 void glGetInteger64v(GLenum pname, GLint64 *data) {
     if (!data) return;
@@ -656,122 +838,669 @@ void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *params) {
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
     void *src = glMapBufferRange(readTarget, readOffset, size, GL_MAP_READ_BIT);
     if (!src) return;
-    void *tmp = malloc((size_t)size);
+    void *tmp = gl_mem_alloc(GL_MEM_TYPE_MEM2, (size_t)size, 64);
     if (tmp) { memcpy(tmp, src, (size_t)size); glUnmapBuffer(readTarget); }
     else { glUnmapBuffer(readTarget); return; }
     void *dst = glMapBufferRange(writeTarget, writeOffset, size, GL_MAP_WRITE_BIT);
     if (dst) memcpy(dst, tmp, (size_t)size);
     glUnmapBuffer(writeTarget);
-    free(tmp);
+    gl_mem_free(GL_MEM_TYPE_MEM2, tmp);
 }
 
 
 void glGetUniformIndices(GLuint program, GLsizei count, const GLchar *const *names, GLuint *indices) {
+    GLint active_uniforms = 0;
+    GLchar active_name[256];
+    GLsizei active_name_length = 0;
+
+    if (!indices || !names || count < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (!_gl_IsProgram(program)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+
     for (GLsizei i = 0; i < count; i++) indices[i] = GL_INVALID_INDEX;
-    (void)program; (void)names;
+    _gl_GetProgramiv(program, GL_ACTIVE_UNIFORMS, &active_uniforms);
+
+    for (GLsizei i = 0; i < count; ++i) {
+        if (!names[i]) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        for (GLint uniform_index = 0; uniform_index < active_uniforms; ++uniform_index) {
+            memset(active_name, 0, sizeof(active_name));
+            active_name_length = 0;
+            _gl_GetActiveUniformName(program, (GLuint)uniform_index, (GLsizei)sizeof(active_name),
+                                     &active_name_length, active_name);
+            if (strcmp(active_name, names[i]) == 0) {
+                indices[i] = (GLuint)uniform_index;
+                break;
+            }
+        }
+    }
+}
+
+static bool is_wrapper_framebuffer_target(GLenum target) {
+    return target == GL_FRAMEBUFFER ||
+           target == GL_DRAW_FRAMEBUFFER ||
+           target == GL_READ_FRAMEBUFFER;
+}
+
+static bool is_wrapper_framebuffer_attachment(GLenum attachment) {
+    return (attachment >= GL_COLOR_ATTACHMENT0 &&
+            attachment <= GL_COLOR_ATTACHMENT7) ||
+           attachment == GL_DEPTH_ATTACHMENT ||
+           attachment == GL_STENCIL_ATTACHMENT ||
+           attachment == GL_DEPTH_STENCIL_ATTACHMENT;
+}
+
+static bool is_cube_map_face_wrapper_target(GLenum target) {
+    return target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
+           target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+}
+
+static bool is_transform_feedback_primitive_mode(GLenum mode) {
+    return mode == GL_POINTS || mode == GL_LINES || mode == GL_TRIANGLES;
 }
 
 
 void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
-    (void)layer; glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
+    if (!is_wrapper_framebuffer_target(target) ||
+        !is_wrapper_framebuffer_attachment(attachment)) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (level < 0 || layer < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (texture != 0 && !_gl_IsTexture(texture)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    /* gx2gl does not yet support layered framebuffer attachments. */
+    _gl_set_error(GL_INVALID_OPERATION);
 }
 
 
-void glBindFragDataLocation(GLuint program, GLuint color, const GLchar *name) { (void)program; (void)color; (void)name; }
-GLint glGetFragDataLocation(GLuint program, const GLchar *name) { (void)program; (void)name; return -1; }
-void glBindFragDataLocationIndexed(GLuint program, GLuint colorNumber, GLuint index, const GLchar *name) { (void)program; (void)colorNumber; (void)index; (void)name; }
-GLint glGetFragDataIndex(GLuint program, const GLchar *name) { (void)program; (void)name; return -1; }
+void glBindFragDataLocation(GLuint program, GLuint color, const GLchar *name) {
+    if (!_gl_IsProgram(program)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (color >= 8 || !name) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+GLint glGetFragDataLocation(GLuint program, const GLchar *name) {
+    if (!_gl_IsProgram(program) || !name) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return -1;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+    return -1;
+}
+void glBindFragDataLocationIndexed(GLuint program, GLuint colorNumber, GLuint index, const GLchar *name) {
+    if (!_gl_IsProgram(program)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (colorNumber >= 8 || index > 0 || !name) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+GLint glGetFragDataIndex(GLuint program, const GLchar *name) {
+    if (!_gl_IsProgram(program) || !name) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return -1;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+    return -1;
+}
 
 
-void glBeginTransformFeedback(GLenum primitiveMode) { (void)primitiveMode; _gl_set_error(GL_INVALID_OPERATION); }
+void glBeginTransformFeedback(GLenum primitiveMode) {
+    if (!is_transform_feedback_primitive_mode(primitiveMode)) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 void glEndTransformFeedback(void) { _gl_set_error(GL_INVALID_OPERATION); }
-void glPauseTransformFeedback(void) {}
-void glResumeTransformFeedback(void) {}
-void glBindTransformFeedback(GLenum target, GLuint id) { (void)target; (void)id; }
+void glPauseTransformFeedback(void) { _gl_set_error(GL_INVALID_OPERATION); }
+void glResumeTransformFeedback(void) { _gl_set_error(GL_INVALID_OPERATION); }
+void glBindTransformFeedback(GLenum target, GLuint id) {
+    (void)id;
+    if (target != GL_TRANSFORM_FEEDBACK) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 GLboolean glIsTransformFeedback(GLuint id) { (void)id; return GL_FALSE; }
-void glTransformFeedbackVaryings(GLuint p, GLsizei c, const GLchar *const *v, GLenum m) { (void)p;(void)c;(void)v;(void)m; }
-void glGetTransformFeedbackVarying(GLuint p, GLuint i, GLsizei bs, GLsizei *l, GLsizei *s, GLenum *t, GLchar *n) { (void)p;(void)i;(void)bs; if(l)*l=0; if(n)n[0]='\0'; (void)s;(void)t; }
-void glDrawTransformFeedback(GLenum mode, GLuint id) { (void)id; glDrawArrays(mode, 0, 0); }
-void glClampColor(GLenum target, GLenum clamp) { (void)target; (void)clamp; }
-void glProvokingVertex(GLenum mode) { (void)mode; }
+void glTransformFeedbackVaryings(GLuint p, GLsizei c, const GLchar *const *v, GLenum m) {
+    if (!_gl_IsProgram(p) || c < 0 || (c > 0 && !v)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (m != GL_INTERLEAVED_ATTRIBS && m != GL_SEPARATE_ATTRIBS) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glGetTransformFeedbackVarying(GLuint p, GLuint i, GLsizei bs, GLsizei *l, GLsizei *s, GLenum *t, GLchar *n) {
+    (void)i;
+    if (!_gl_IsProgram(p) || bs < 0 || (bs > 0 && !n)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (l) *l = 0;
+    if (n && bs > 0) n[0] = '\0';
+    if (s) *s = 0;
+    if (t) *t = 0;
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glDrawTransformFeedback(GLenum mode, GLuint id) {
+    (void)id;
+    if (!is_transform_feedback_primitive_mode(mode)) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glClampColor(GLenum target, GLenum clamp) {
+    if (target != GL_CLAMP_VERTEX_COLOR &&
+        target != GL_CLAMP_FRAGMENT_COLOR &&
+        target != GL_CLAMP_READ_COLOR) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (clamp != GL_TRUE && clamp != GL_FALSE && clamp != GL_FIXED_ONLY) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glProvokingVertex(GLenum mode) {
+    if (mode != GL_FIRST_VERTEX_CONVENTION &&
+        mode != GL_LAST_VERTEX_CONVENTION) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 
 
 struct __GLsync { int dummy; };
 static struct __GLsync g_sync_sentinel = {1};
-GLsync glFenceSync(GLenum condition, GLbitfield flags) { (void)condition; (void)flags; GX2DrawDone(); return &g_sync_sentinel; }
+GLsync glFenceSync(GLenum condition, GLbitfield flags) {
+    if (condition != GL_SYNC_GPU_COMMANDS_COMPLETE) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return NULL;
+    }
+    if (flags != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return NULL;
+    }
+    GX2DrawDone();
+    return &g_sync_sentinel;
+}
 GLboolean glIsSync(GLsync sync) { return (sync == &g_sync_sentinel) ? GL_TRUE : GL_FALSE; }
-void glDeleteSync(GLsync sync) { (void)sync; }
-GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { (void)sync; (void)flags; (void)timeout; GX2DrawDone(); return GL_ALREADY_SIGNALED; }
-void glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { (void)sync; (void)flags; (void)timeout; GX2DrawDone(); }
+void glDeleteSync(GLsync sync) {
+    if (sync != &g_sync_sentinel) {
+        _gl_set_error(GL_INVALID_VALUE);
+    }
+}
+GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    (void)timeout;
+    if (sync != &g_sync_sentinel) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return GL_WAIT_FAILED;
+    }
+    if (flags & ~GL_SYNC_FLUSH_COMMANDS_BIT) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return GL_WAIT_FAILED;
+    }
+    GX2DrawDone();
+    return GL_ALREADY_SIGNALED;
+}
+void glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    if (sync != &g_sync_sentinel) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (flags != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (timeout != GL_TIMEOUT_IGNORED) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    GX2DrawDone();
+}
 void glGetSynciv(GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length, GLint *values) {
-    (void)sync; (void)pname; (void)bufSize;
-    if (length) *length = 1;
-    if (values && bufSize >= 1) values[0] = GL_SIGNALED;
+    GLint value;
+
+    if (sync != &g_sync_sentinel) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (bufSize < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+
+    switch (pname) {
+    case GL_OBJECT_TYPE:
+        value = GL_SYNC_FENCE;
+        break;
+    case GL_SYNC_CONDITION:
+        value = GL_SYNC_GPU_COMMANDS_COMPLETE;
+        break;
+    case GL_SYNC_STATUS:
+        value = GL_SIGNALED;
+        break;
+    case GL_SYNC_FLAGS:
+        value = 0;
+        break;
+    default:
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+
+    if (length) *length = bufSize > 0 ? 1 : 0;
+    if (values && bufSize > 0) values[0] = value;
 }
 
 
-void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) { (void)pname; (void)index; if(val){val[0]=0.5f;val[1]=0.5f;} }
-void glSampleMaski(GLuint maskNumber, GLbitfield mask) { (void)maskNumber; (void)mask; }
+void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
+    (void)val;
+    if (pname != GL_SAMPLE_POSITION) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (index != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glSampleMaski(GLuint maskNumber, GLbitfield mask) {
+    (void)mask;
+    if (maskNumber != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei w, GLsizei h, GLboolean fixed) {
-    (void)samples; (void)fixed; glTexImage2D(target, 0, internalformat, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    (void)internalformat; (void)fixed;
+    if (target != GL_TEXTURE_2D_MULTISAMPLE &&
+        target != GL_PROXY_TEXTURE_2D_MULTISAMPLE) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (samples <= 0 || w < 0 || h < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
 }
 void glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei w, GLsizei h, GLsizei d, GLboolean fixed) {
-    (void)samples; (void)fixed; glTexImage3D(target, 0, internalformat, w, h, d, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    (void)internalformat; (void)fixed;
+    if (target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY &&
+        target != GL_PROXY_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (samples <= 0 || w < 0 || h < 0 || d < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
 }
 
 
-void glQueryCounter(GLuint id, GLenum target) { (void)id; (void)target; }
-void glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64 *params) { (void)id; (void)pname; if(params)*params=0; }
-void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params) { (void)id; (void)pname; if(params)*params=0; }
+void glQueryCounter(GLuint id, GLenum target) {
+    if (target != GL_TIMESTAMP) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (id == 0) {
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64 *params) {
+    if (params) *params = 0;
+    if (pname != GL_QUERY_RESULT && pname != GL_QUERY_RESULT_AVAILABLE) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (id == 0) {
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params) {
+    if (params) *params = 0;
+    if (pname != GL_QUERY_RESULT && pname != GL_QUERY_RESULT_AVAILABLE) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (id == 0) {
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 
 
-void glVertexAttribP1ui(GLuint i, GLenum t, GLboolean n, GLuint v) { (void)t;(void)n; glVertexAttrib1f(i,(GLfloat)v); }
-void glVertexAttribP2ui(GLuint i, GLenum t, GLboolean n, GLuint v) { (void)t;(void)n; glVertexAttrib2f(i,(GLfloat)v,0.0f); }
-void glVertexAttribP3ui(GLuint i, GLenum t, GLboolean n, GLuint v) { (void)t;(void)n; glVertexAttrib3f(i,(GLfloat)v,0.0f,0.0f); }
-void glVertexAttribP4ui(GLuint i, GLenum t, GLboolean n, GLuint v) { (void)t;(void)n; glVertexAttrib4f(i,(GLfloat)v,0.0f,0.0f,1.0f); }
-void glVertexAttribP1uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if(v) glVertexAttribP1ui(i,t,n,*v); }
-void glVertexAttribP2uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if(v) glVertexAttribP2ui(i,t,n,*v); }
-void glVertexAttribP3uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if(v) glVertexAttribP3ui(i,t,n,*v); }
-void glVertexAttribP4uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if(v) glVertexAttribP4ui(i,t,n,*v); }
+static GLint sign_extend_packed(GLuint value, uint32_t bits) {
+    const GLuint sign_bit = 1u << (bits - 1u);
+    const GLuint mask = (1u << bits) - 1u;
+    value &= mask;
+    return (GLint)((value ^ sign_bit) - sign_bit);
+}
+
+static GLfloat unpack_signed_component(GLuint value, uint32_t bits, GLboolean normalized) {
+    const GLint signed_value = sign_extend_packed(value, bits);
+
+    if (!normalized) {
+        return (GLfloat)signed_value;
+    }
+
+    if (signed_value == -(1 << (bits - 1u))) {
+        return -1.0f;
+    }
+    return (GLfloat)signed_value / (GLfloat)((1 << (bits - 1u)) - 1);
+}
+
+static GLfloat unpack_unsigned_component(GLuint value, uint32_t bits, GLboolean normalized) {
+    const GLuint mask = (1u << bits) - 1u;
+    value &= mask;
+
+    if (!normalized) {
+        return (GLfloat)value;
+    }
+
+    return (GLfloat)value / (GLfloat)mask;
+}
+
+static void set_vertex_attrib_packed(GLuint index, GLuint packed, GLenum type,
+                                     GLboolean normalized, GLuint component_count) {
+    GLfloat components[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+    if (type == GL_INT_2_10_10_10_REV) {
+        components[0] = unpack_signed_component(packed >> 0u, 10u, normalized);
+        components[1] = unpack_signed_component(packed >> 10u, 10u, normalized);
+        components[2] = unpack_signed_component(packed >> 20u, 10u, normalized);
+        components[3] = unpack_signed_component(packed >> 30u, 2u, normalized);
+    } else if (type == GL_UNSIGNED_INT_2_10_10_10_REV) {
+        components[0] = unpack_unsigned_component(packed >> 0u, 10u, normalized);
+        components[1] = unpack_unsigned_component(packed >> 10u, 10u, normalized);
+        components[2] = unpack_unsigned_component(packed >> 20u, 10u, normalized);
+        components[3] = unpack_unsigned_component(packed >> 30u, 2u, normalized);
+    } else {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+
+    switch (component_count) {
+    case 1:
+        _gl_VertexAttrib4f(index, components[0], 0.0f, 0.0f, 1.0f);
+        break;
+    case 2:
+        _gl_VertexAttrib4f(index, components[0], components[1], 0.0f, 1.0f);
+        break;
+    case 3:
+        _gl_VertexAttrib4f(index, components[0], components[1], components[2], 1.0f);
+        break;
+    case 4:
+        _gl_VertexAttrib4f(index, components[0], components[1], components[2], components[3]);
+        break;
+    default:
+        _gl_set_error(GL_INVALID_VALUE);
+        break;
+    }
+}
+
+void glVertexAttribP1ui(GLuint i, GLenum t, GLboolean n, GLuint v) { set_vertex_attrib_packed(i, v, t, n, 1); }
+void glVertexAttribP2ui(GLuint i, GLenum t, GLboolean n, GLuint v) { set_vertex_attrib_packed(i, v, t, n, 2); }
+void glVertexAttribP3ui(GLuint i, GLenum t, GLboolean n, GLuint v) { set_vertex_attrib_packed(i, v, t, n, 3); }
+void glVertexAttribP4ui(GLuint i, GLenum t, GLboolean n, GLuint v) { set_vertex_attrib_packed(i, v, t, n, 4); }
+void glVertexAttribP1uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { _gl_set_error(GL_INVALID_VALUE); return; } glVertexAttribP1ui(i, t, n, *v); }
+void glVertexAttribP2uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { _gl_set_error(GL_INVALID_VALUE); return; } glVertexAttribP2ui(i, t, n, *v); }
+void glVertexAttribP3uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { _gl_set_error(GL_INVALID_VALUE); return; } glVertexAttribP3ui(i, t, n, *v); }
+void glVertexAttribP4uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { _gl_set_error(GL_INVALID_VALUE); return; } glVertexAttribP4ui(i, t, n, *v); }
 
 
-void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) { (void)target;(void)internalformat;(void)buffer; _gl_set_error(GL_INVALID_OPERATION); }
+void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
+    (void)internalformat;
+    if (target != GL_TEXTURE_BUFFER) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (buffer != 0 && !_gl_IsBuffer(buffer)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 
 
-void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) { (void)target;(void)attachment;(void)textarget;(void)texture;(void)level; }
-void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) { (void)target;(void)attachment;(void)textarget;(void)texture;(void)level;(void)zoffset; }
+void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+    if (!is_wrapper_framebuffer_target(target) ||
+        !is_wrapper_framebuffer_attachment(attachment) ||
+        textarget != GL_TEXTURE_1D) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (level < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (texture != 0 && !_gl_IsTexture(texture)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    /* gx2gl does not support GL_TEXTURE_1D attachments. */
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) {
+    if (!is_wrapper_framebuffer_target(target) ||
+        !is_wrapper_framebuffer_attachment(attachment) ||
+        textarget != GL_TEXTURE_3D) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (level < 0 || zoffset < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (texture != 0 && !_gl_IsTexture(texture)) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    /* gx2gl does not support legacy 3D texture slice attachment entrypoints yet. */
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 void glGetBooleani_v(GLenum target, GLuint index, GLboolean *data) {
-    GLint v = 0; glGetIntegeri_v(target, index, &v); if (data) *data = v ? GL_TRUE : GL_FALSE;
-}
-void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, GLvoid *data) { _gl_GetBufferSubData(target, offset, size, data); }
-void glGetCompressedTexImage(GLenum target, GLint level, GLvoid *img) { (void)target;(void)level;(void)img; }
-void glGetPointerv(GLenum pname, GLvoid **params) {
-    if (!params) return;
-    if (pname == 0x8449) { *params = NULL; return; }
-    GLuint idx = (pname >= 0x8626 && pname <= 0x8641) ? pname - 0x8626 : 0;
-    GLfloat dummy[4] = {0,0,0,0};
-    glGetVertexAttribfv(idx, 0x8645, dummy);
-    *params = NULL;
-}
-void glGetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params) { _gl_GetSamplerParameterIiv(sampler, pname, params); }
-void glGetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params) { _gl_GetSamplerParameterIuiv(sampler, pname, params); }
+    if (!g_gl_context || !data) return;
 
-void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *pixels) { (void)target;(void)level;(void)format;(void)type;(void)pixels; }
-void glGetTexParameterIiv(GLenum target, GLenum pname, GLint *params) { _gl_GetTexParameterIiv(target, pname, params); }
-void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint *params) { _gl_GetTexParameterIuiv(target, pname, params); }
+    switch (target) {
+    case GL_BLEND:
+        if (index != 0) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        *data = g_gl_context->blend_enabled;
+        break;
+    case GL_SCISSOR_TEST:
+        if (index != 0) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        *data = g_gl_context->scissor_test_enabled;
+        break;
+    case GL_COLOR_WRITEMASK:
+        if (index != 0) {
+            _gl_set_error(GL_INVALID_VALUE);
+            return;
+        }
+        data[0] = g_gl_context->color_mask[0];
+        data[1] = g_gl_context->color_mask[1];
+        data[2] = g_gl_context->color_mask[2];
+        data[3] = g_gl_context->color_mask[3];
+        break;
+    default:
+        _gl_set_error(GL_INVALID_ENUM);
+        break;
+    }
+}
+void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, GLvoid *data) {
+    void *src;
+
+    if (size < 0 || offset < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (size == 0) {
+        return;
+    }
+    if (!data) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+
+    src = glMapBufferRange(target, offset, size, GL_MAP_READ_BIT);
+    if (!src) return;
+    memcpy(data, src, (size_t)size);
+    glUnmapBuffer(target);
+}
+void glGetCompressedTexImage(GLenum target, GLint level, GLvoid *img) {
+    (void)img;
+    if (target != GL_TEXTURE_1D &&
+        target != GL_TEXTURE_2D &&
+        target != GL_TEXTURE_3D &&
+        !is_cube_map_face_wrapper_target(target)) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (level < 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glGetPointerv(GLenum pname, GLvoid **params) {
+    (void)pname;
+    if (params) *params = NULL;
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glGetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params) {
+    if (!params) return;
+    glGetSamplerParameteriv(sampler, pname, params);
+}
+void glGetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params) {
+    GLint value = 0;
+
+    if (!params) return;
+    glGetSamplerParameteriv(sampler, pname, &value);
+    *params = (GLuint)value;
+}
+
+void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *pixels) {
+    _gl_GetTexImage(target, level, format, type, pixels);
+}
+void glGetTexParameterIiv(GLenum target, GLenum pname, GLint *params) {
+    if (!params) return;
+    glGetTexParameteriv(target, pname, params);
+}
+void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint *params) {
+    GLint value = 0;
+
+    if (!params) return;
+    glGetTexParameteriv(target, pname, &value);
+    *params = (GLuint)value;
+}
 void glGetVertexAttribdv(GLuint index, GLenum pname, GLdouble *params) {
-    GLfloat v[4] = {0,0,0,0}; glGetVertexAttribfv(index, pname, v); if (params) *params = (GLdouble)v[0];
+    GLfloat values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (!params) return;
+    glGetVertexAttribfv(index, pname, values);
+    if (pname == GL_CURRENT_VERTEX_ATTRIB) {
+        params[0] = (GLdouble)values[0];
+        params[1] = (GLdouble)values[1];
+        params[2] = (GLdouble)values[2];
+        params[3] = (GLdouble)values[3];
+    } else {
+        params[0] = (GLdouble)values[0];
+    }
 }
 void glPixelStoref(GLenum pname, GLfloat param) { glPixelStorei(pname, (GLint)param); }
-void glPointParameterf(GLenum pname, GLfloat param) { (void)pname;(void)param; }
-void glPointParameterfv(GLenum pname, const GLfloat *params) { if (params) glPointParameterf(pname, params[0]); }
-void glPointParameteri(GLenum pname, GLint param) { glPointParameterf(pname, (GLfloat)param); }
-void glPointParameteriv(GLenum pname, const GLint *params) { if (params) glPointParameterf(pname, (GLfloat)params[0]); }
-void glSamplerParameterIiv(GLuint sampler, GLenum pname, const GLint *param) { _gl_SamplerParameterIiv(sampler, pname, param); }
-void glSamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint *param) { _gl_SamplerParameterIuiv(sampler, pname, param); }
-void glTexParameterIiv(GLenum target, GLenum pname, const GLint *params) { _gl_TexParameterIiv(target, pname, params); }
-void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint *params) { _gl_TexParameterIuiv(target, pname, params); }
+void glPointParameterf(GLenum pname, GLfloat param) {
+    (void)param;
+    if (pname != GL_POINT_SIZE_MIN &&
+        pname != GL_POINT_SIZE_MAX &&
+        pname != GL_POINT_FADE_THRESHOLD_SIZE) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glPointParameterfv(GLenum pname, const GLfloat *params) {
+    (void)params;
+    if (pname != GL_POINT_DISTANCE_ATTENUATION) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glPointParameteri(GLenum pname, GLint param) {
+    glPointParameterf(pname, (GLfloat)param);
+}
+void glPointParameteriv(GLenum pname, const GLint *params) {
+    (void)params;
+    if (pname != GL_POINT_DISTANCE_ATTENUATION) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void glSamplerParameterIiv(GLuint sampler, GLenum pname, const GLint *param) {
+    if (!param) return;
+    glSamplerParameteriv(sampler, pname, param);
+}
+void glSamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint *param) {
+    GLint value;
 
+    if (!param) return;
+    value = (GLint)param[0];
+    glSamplerParameteriv(sampler, pname, &value);
+}
+void glTexParameterIiv(GLenum target, GLenum pname, const GLint *params) {
+    if (!params) return;
+    glTexParameteriv(target, pname, params);
+}
+void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint *params) {
+    GLint value;
+
+    if (!params) return;
+    value = (GLint)params[0];
+    glTexParameteriv(target, pname, &value);
+}
 void glVertexAttrib1d(GLuint index, GLdouble x) { glVertexAttrib1f(index, (GLfloat)x); }
 void glVertexAttrib1dv(GLuint index, const GLdouble *v) { if(v) glVertexAttrib1f(index, (GLfloat)v[0]); }
 void glVertexAttrib1s(GLuint index, GLshort x) { glVertexAttrib1f(index, (GLfloat)x); }

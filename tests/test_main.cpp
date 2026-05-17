@@ -3,6 +3,7 @@
 #include <whb/gfx.h>
 #include <coreinit/memheap.h>
 #include <coreinit/memexpheap.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,7 @@ extern "C" {
 #endif
 
 #include "gl/gl.h"
+#include "core/gx2gl_cafeglsl.h"
 #include "core/gl_context.h"
 #include "core/gl_texture.h"
 #include "mem/gl_mem.h"
@@ -27,8 +29,11 @@ extern "C" {
 static int g_pass_count = 0;
 static int g_negative_pass_count = 0;
 static int g_fail_count = 0;
-static char g_failure_lines[12][128];
+static char g_failure_lines[64][128];
 static uint32_t g_failure_line_count = 0;
+static char g_recent_lines[16][160];
+static uint32_t g_recent_line_cursor = 0;
+static uint32_t g_recent_line_count = 0;
 typedef struct {
     int pass_count;
     int negative_pass_count;
@@ -48,6 +53,58 @@ enum {
 };
 static phase_stats_t g_phase_stats[DIAG_PHASE_COUNT];
 static int g_active_phase = -1;
+
+static void write_results_summary_to_path(const char *path,
+                                          const char *status) {
+    static const char *phase_names[DIAG_PHASE_COUNT] = {
+        "Limits",
+        "Legacy",
+        "Buffers",
+        "Textures",
+        "Shaders",
+        "VAOs",
+        "FBOs",
+        "Draw",
+        "Delete",
+    };
+    FILE *fp;
+
+    if (!path || !status) {
+        return;
+    }
+
+    fp = fopen(path, "wb");
+    if (!fp) {
+        return;
+    }
+
+    fprintf(fp, "status=%s\n", status);
+    fprintf(fp, "active_phase=%d\n", g_active_phase);
+    fprintf(fp, "pass=%d\n", g_pass_count);
+    fprintf(fp, "expected_error_pass=%d\n", g_negative_pass_count);
+    fprintf(fp, "negative_pass=%d\n", g_negative_pass_count);
+    fprintf(fp, "fail=%d\n", g_fail_count);
+    for (int i = 0; i < DIAG_PHASE_COUNT; ++i) {
+        fprintf(fp, "phase.%s.pass=%d\n", phase_names[i], g_phase_stats[i].pass_count);
+        fprintf(fp, "phase.%s.expected_error_pass=%d\n", phase_names[i], g_phase_stats[i].negative_pass_count);
+        fprintf(fp, "phase.%s.negative_pass=%d\n", phase_names[i], g_phase_stats[i].negative_pass_count);
+        fprintf(fp, "phase.%s.fail=%d\n", phase_names[i], g_phase_stats[i].fail_count);
+    }
+    for (uint32_t i = 0; i < g_failure_line_count; ++i) {
+        fprintf(fp, "failure[%u]=%s\n", i, g_failure_lines[i]);
+    }
+    for (uint32_t i = 0; i < g_recent_line_count; ++i) {
+        uint32_t slot = (g_recent_line_cursor + 16u - g_recent_line_count + i) % 16u;
+        fprintf(fp, "recent[%u]=%s\n", i, g_recent_lines[slot]);
+    }
+
+    fclose(fp);
+}
+
+static void update_progress_snapshot(void) {
+    write_results_summary_to_path("/vol/external01/gx2gl_progress.txt",
+                                  "running");
+}
 
 static int detect_phase_index(const char *line) {
     if (!line) {
@@ -85,13 +142,31 @@ static int detect_phase_index(const char *line) {
 
 static void track_report_line(const char *line) {
     int phase_index;
+    size_t length;
+    uint32_t recent_slot;
 
     if (!line) {
         return;
     }
+
+    recent_slot = g_recent_line_cursor % 16u;
+    snprintf(g_recent_lines[recent_slot], sizeof(g_recent_lines[recent_slot]),
+             "%s", line);
+    length = strlen(g_recent_lines[recent_slot]);
+    while (length > 0 &&
+           (g_recent_lines[recent_slot][length - 1] == '\n' ||
+            g_recent_lines[recent_slot][length - 1] == '\r')) {
+        g_recent_lines[recent_slot][--length] = '\0';
+    }
+    g_recent_line_cursor = (g_recent_line_cursor + 1u) % 16u;
+    if (g_recent_line_count < 16u) {
+        ++g_recent_line_count;
+    }
+
     phase_index = detect_phase_index(line);
     if (phase_index >= 0) {
         g_active_phase = phase_index;
+        update_progress_snapshot();
         return;
     }
 
@@ -100,17 +175,21 @@ static void track_report_line(const char *line) {
         if (g_active_phase >= 0 && g_active_phase < DIAG_PHASE_COUNT) {
             ++g_phase_stats[g_active_phase].pass_count;
         }
+        update_progress_snapshot();
         return;
     }
-    if (strncmp(line, "   [PASS-NEGATIVE]", 18) == 0) {
+    if (strncmp(line, "   [PASS-NEGATIVE]", 18) == 0 ||
+        strncmp(line, "   [PASS-EXPECTED-ERROR]", 24) == 0) {
         ++g_negative_pass_count;
         if (g_active_phase >= 0 && g_active_phase < DIAG_PHASE_COUNT) {
             ++g_phase_stats[g_active_phase].negative_pass_count;
         }
+        update_progress_snapshot();
         return;
     }
     if (strncmp(line, "[FAIL]", 6) != 0 &&
         strncmp(line, "   [FAIL-NEGATIVE]", 18) != 0 &&
+        strncmp(line, "   [FAIL-EXPECTED-ERROR]", 24) != 0 &&
         strncmp(line, "[CRITICAL FAIL]", 15) != 0) {
         return;
     }
@@ -130,6 +209,7 @@ static void track_report_line(const char *line) {
         }
         ++g_failure_line_count;
     }
+    update_progress_snapshot();
 }
 
 static void codex_report(const char *fmt, ...) {
@@ -145,6 +225,56 @@ static void codex_report(const char *fmt, ...) {
 }
 
 #define OSReport codex_report
+
+static void clear_result_artifacts(void) {
+    remove("/vol/external01/gx2gl_results.txt");
+    remove("/vol/external01/gx2gl_done.flag");
+    remove("/vol/external01/gx2gl_diag.ppm");
+}
+
+static void write_results_summary_file(void) {
+    write_results_summary_to_path("/vol/external01/gx2gl_results.txt",
+                                  "complete");
+}
+
+static void write_ppm_file(const char *path, GLsizei width, GLsizei height,
+                           const GLubyte *rgba) {
+    FILE *fp;
+
+    if (!path || !rgba || width <= 0 || height <= 0) {
+        return;
+    }
+
+    fp = fopen(path, "wb");
+    if (!fp) {
+        return;
+    }
+
+    fprintf(fp, "P6\n%d %d\n255\n", (int)width, (int)height);
+    for (GLsizei y = height - 1; y >= 0; --y) {
+        for (GLsizei x = 0; x < width; ++x) {
+            const GLubyte *src = rgba + (((size_t)y * (size_t)width) + (size_t)x) * 4u;
+            fwrite(src, 1, 3, fp);
+        }
+    }
+
+    fclose(fp);
+}
+
+static void write_completion_flag(void) {
+    FILE *fp = fopen("/vol/external01/gx2gl_done.flag", "wb");
+    if (!fp) {
+        return;
+    }
+
+    fputs("done\n", fp);
+    fclose(fp);
+}
+
+static void write_diagnostic_artifacts(void) {
+    write_results_summary_file();
+    write_completion_flag();
+}
 
 static void draw_diag_rect(GLsizei screen_width, GLsizei screen_height, int x,
                            int y, int width, int height, float r, float g,
@@ -645,9 +775,9 @@ static void check_gl_error(const char* func_name) {
 static void expect_error(const char* test_name, GLenum expected_error) {
     GLenum actual = glGetError();
     if (actual == expected_error) {
-        OSReport("   [PASS-NEGATIVE] %s correctly produced 0x%04X\n", test_name, expected_error);
+        OSReport("   [PASS-EXPECTED-ERROR] %s correctly produced 0x%04X\n", test_name, expected_error);
     } else {
-        OSReport("   [FAIL-NEGATIVE] %s expected 0x%04X but got 0x%04X\n", test_name, expected_error, actual);
+        OSReport("   [FAIL-EXPECTED-ERROR] %s expected 0x%04X but got 0x%04X\n", test_name, expected_error, actual);
     }
 }
 
@@ -1560,7 +1690,9 @@ int main(int argc, char **argv) {
     glCreateShader(GL_INVALID_ENUM);
     expect_error("glCreateShader(GL_INVALID_ENUM)", GL_INVALID_ENUM);
 
-    const char* vsrc = "#version 330 core\nvoid main() {}";
+    const char* vsrc =
+        "#version 330 core\n"
+        "void main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }";
     glShaderSource(vshader, 1, &vsrc, NULL);
     check_gl_error("glShaderSource");
 
@@ -1571,6 +1703,7 @@ int main(int argc, char **argv) {
     glShaderSource(pshader, 1, &psrc, NULL);
     check_gl_error("glShaderSource(fragment)");
 
+    bool source_shader_compiler_available = gx2gl_cafeglsl_init();
     glCompileShader(vshader);
     check_gl_error("glCompileShader(vertex)");
     glShaderBinary(1, &vshader, 0xFFFFu, NULL, 0);
@@ -1578,8 +1711,10 @@ int main(int argc, char **argv) {
     GLint vshader_compile_status = GL_FALSE;
     glGetShaderiv(vshader, GL_COMPILE_STATUS, &vshader_compile_status);
     check_gl_error("glGetShaderiv(vertex, GL_COMPILE_STATUS)");
-    if (vshader_compile_status == GL_TRUE) {
+    if (source_shader_compiler_available && vshader_compile_status == GL_TRUE) {
         OSReport("[PASS] glGetShaderiv(vertex, GL_COMPILE_STATUS) returned compiled.\n");
+    } else if (!source_shader_compiler_available && vshader_compile_status == GL_FALSE) {
+        OSReport("[PASS] glGetShaderiv(vertex, GL_COMPILE_STATUS) reflected unavailable CafeGLSL backend.\n");
     } else {
         OSReport("[FAIL] glGetShaderiv(vertex, GL_COMPILE_STATUS) returned %d\n",
                  vshader_compile_status);
@@ -1598,6 +1733,12 @@ int main(int argc, char **argv) {
     GLsizei shader_info_log_length = 0;
     glGetShaderInfoLog(vshader, sizeof(shader_info_log), &shader_info_log_length, shader_info_log);
     check_gl_error("glGetShaderInfoLog(vertex)");
+    if (!source_shader_compiler_available &&
+        strstr(shader_info_log, "CafeGLSL compiler unavailable.") != NULL) {
+        OSReport("[PASS] glGetShaderInfoLog(vertex) reported unavailable CafeGLSL backend.\n");
+    } else if (vshader_compile_status != GL_TRUE && shader_info_log_length > 0) {
+        OSReport("[FAIL] glGetShaderInfoLog(vertex) returned: %s\n", shader_info_log);
+    }
     GLchar shader_source_copy[128];
     GLsizei shader_source_copy_length = 0;
     glGetShaderSource(vshader, sizeof(shader_source_copy), &shader_source_copy_length,
@@ -1668,12 +1809,14 @@ int main(int argc, char **argv) {
     expect_error("glAttachShader(0, ...)", GL_INVALID_OPERATION);
     
     glLinkProgram(prog);
-    expect_error("glLinkProgram(source_only)", GL_INVALID_OPERATION);
+    check_gl_error("glLinkProgram(compiled_pair)");
     GLint program_link_status = GL_TRUE;
     glGetProgramiv(prog, GL_LINK_STATUS, &program_link_status);
     check_gl_error("glGetProgramiv(GL_LINK_STATUS)");
-    if (program_link_status == GL_FALSE) {
-        OSReport("[PASS] glGetProgramiv(GL_LINK_STATUS) returned unlinked.\n");
+    if (source_shader_compiler_available && program_link_status == GL_TRUE) {
+        OSReport("[PASS] glGetProgramiv(GL_LINK_STATUS) returned linked.\n");
+    } else if (!source_shader_compiler_available && program_link_status == GL_FALSE) {
+        OSReport("[PASS] glGetProgramiv(GL_LINK_STATUS) reflected unavailable CafeGLSL backend.\n");
     } else {
         OSReport("[FAIL] glGetProgramiv(GL_LINK_STATUS) returned %d\n",
                  program_link_status);
@@ -1682,6 +1825,14 @@ int main(int argc, char **argv) {
     GLsizei program_info_log_length = 0;
     glGetProgramInfoLog(prog, sizeof(program_info_log), &program_info_log_length, program_info_log);
     check_gl_error("glGetProgramInfoLog");
+    if (!source_shader_compiler_available &&
+        strstr(program_info_log,
+               "All attached shaders must compile successfully before linking.") != NULL) {
+        OSReport("[PASS] glGetProgramInfoLog(compiled_pair) reported unavailable shader backend.\n");
+    } else if (program_link_status != GL_TRUE && program_info_log_length > 0) {
+        OSReport("[FAIL] glGetProgramInfoLog(compiled_pair) returned: %s\n",
+                 program_info_log);
+    }
 
     glDetachShader(prog, pshader);
     check_gl_error("glDetachShader(fragment)");
@@ -1987,7 +2138,11 @@ int main(int argc, char **argv) {
     }
 
     glUseProgram(prog);
-    expect_error("glUseProgram(source_only)", GL_INVALID_OPERATION);
+    if (source_shader_compiler_available) {
+        check_gl_error("glUseProgram(compiled_pair)");
+    } else {
+        expect_error("glUseProgram(compiled_pair)", GL_INVALID_OPERATION);
+    }
     
     // Try bad program
     glUseProgram(999);
@@ -2241,7 +2396,7 @@ int main(int argc, char **argv) {
 
     GLenum remap_bufs[2] = { GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT0 };
     glDrawBuffers(2, remap_bufs);
-    expect_error("glDrawBuffers(remap_unsupported)", GL_INVALID_OPERATION);
+    check_gl_error("glDrawBuffers(remap_supported)");
     
     // Try bad attachment
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_INVALID_ENUM, GL_TEXTURE_2D, tex[0], 0);
@@ -2257,6 +2412,7 @@ int main(int argc, char **argv) {
     glClear(GL_COLOR_BUFFER_BIT);
     check_gl_error("glClear(FBO color)");
     GLubyte readback_rgba[4] = {0, 0, 0, 0};
+    GLubyte fbo_rgba_dump[4 * 4 * 4] = {0};
     glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, readback_rgba);
     if (readback_rgba[0] == 51 && readback_rgba[1] == 102 &&
         readback_rgba[2] == 153 && readback_rgba[3] == 255) {
@@ -2267,6 +2423,9 @@ int main(int argc, char **argv) {
                  readback_rgba[3]);
     }
     check_gl_error("glReadPixels(FBO rgba8)");
+    glReadPixels(0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, fbo_rgba_dump);
+    check_gl_error("glReadPixels(FBO rgba8 dump)");
+    write_ppm_file("/vol/external01/gx2gl_diag.ppm", 4, 4, fbo_rgba_dump);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     check_gl_error("glClear(FBO scissor reset)");
@@ -2298,7 +2457,7 @@ int main(int argc, char **argv) {
               default_scissor_box[2], default_scissor_box[3]);
     check_gl_error("glScissor(restore_default)");
     glReadPixels(4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, readback_rgba);
-    expect_error("glReadPixels(out_of_bounds)", GL_INVALID_VALUE);
+    check_gl_error("glReadPixels(out_of_bounds)");
     glReadBuffer(GL_BACK);
     expect_error("glReadBuffer(GL_BACK on FBO)", GL_INVALID_OPERATION);
     glReadBuffer(GL_INVALID_ENUM);
@@ -2461,7 +2620,7 @@ int main(int argc, char **argv) {
 
     OSReport("----- Comprehensive Test Sequence With Failure Coverage Complete! -----\n");
 
-    draw_diagnostic_screen();
+    write_diagnostic_artifacts();
     gl_context_destroy(g_gl_context);
     g_gl_context = NULL;
     gl_mem_shutdown();

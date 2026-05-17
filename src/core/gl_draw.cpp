@@ -3,6 +3,7 @@
 #include "core/gl_context.h"
 #include "core/gl_vao.h"
 #include "core/gl_buffer.h"
+#include "core/gl_framebuffer.h"
 #include <gx2/draw.h>
 #include <gx2/registers.h>
 #include <gx2/enum.h>
@@ -42,6 +43,7 @@ void _gl_DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei in
     if (count == 0 || instancecount == 0) return;
     gl_flush_state();
     GX2DrawEx(prim, count, first, (uint32_t)instancecount);
+    gl_framebuffer_mark_bound_color_dirty();
 }
 
 void _gl_DrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) { _gl_DrawElementsInstanced(mode, count, type, indices, 1); }
@@ -60,18 +62,25 @@ void _gl_DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const GL
     if (!buffer_data) { _gl_set_error(GL_INVALID_OPERATION); return; }
     gl_flush_state();
     GX2DrawIndexedEx(prim, count, idx_type, (uint8_t *)buffer_data + (uintptr_t)indices, 0, (uint32_t)instancecount);
+    gl_framebuffer_mark_bound_color_dirty();
 }
 
 void _gl_DrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const GLvoid *indices) { (void)start; (void)end; _gl_DrawElements(mode, count, type, indices); }
 void _gl_DrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices, GLint basevertex) {
     GX2PrimitiveMode prim;
+    if (!g_gl_context || !g_gl_context->bound_program) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    if (count < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
     if (!validate_draw_mode(mode, &prim)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (count == 0) return;
     GX2IndexType idx_type = map_index_type(type);
     if (idx_type == (GX2IndexType)0xFFFF) { _gl_set_error(GL_INVALID_ENUM); return; }
     GLuint element_buffer = gl_vao_get_element_array_buffer();
+    if (element_buffer == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
     void *buffer_data = gl_buffer_get_data(element_buffer);
+    if (!buffer_data) { _gl_set_error(GL_INVALID_OPERATION); return; }
     gl_flush_state();
     GX2DrawIndexedEx(prim, count, idx_type, (uint8_t *)buffer_data + (uintptr_t)indices, basevertex, 1);
+    gl_framebuffer_mark_bound_color_dirty();
 }
 
 void _gl_DrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const GLvoid *indices, GLint basevertex) {
@@ -80,12 +89,19 @@ void _gl_DrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsi
 
 void _gl_DrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices, GLsizei instancecount, GLint basevertex) {
     GX2PrimitiveMode prim;
+    if (!g_gl_context || !g_gl_context->bound_program) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    if (count < 0 || instancecount < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
     if (!validate_draw_mode(mode, &prim)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (count == 0 || instancecount == 0) return;
     GX2IndexType idx_type = map_index_type(type);
+    if (idx_type == (GX2IndexType)0xFFFF) { _gl_set_error(GL_INVALID_ENUM); return; }
     GLuint element_buffer = gl_vao_get_element_array_buffer();
+    if (element_buffer == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
     void *buffer_data = gl_buffer_get_data(element_buffer);
+    if (!buffer_data) { _gl_set_error(GL_INVALID_OPERATION); return; }
     gl_flush_state();
     GX2DrawIndexedEx(prim, count, idx_type, (uint8_t *)buffer_data + (uintptr_t)indices, basevertex, instancecount);
+    gl_framebuffer_mark_bound_color_dirty();
 }
 
 void _gl_MultiDrawArrays(GLenum mode, const GLint *first, const GLsizei *count, GLsizei drawcount) {

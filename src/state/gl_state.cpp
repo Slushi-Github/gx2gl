@@ -11,6 +11,7 @@ extern "C" {
 #include <gx2/registers.h>
 #include <gx2/mem.h>
 #include <gx2/clear.h>
+#include <coreinit/cache.h>
 #include <string.h>
 
 static int stencil_face_index(GLenum face) {
@@ -107,6 +108,108 @@ static GX2FrontFace map_front_face(GLenum mode) {
   return mode == GL_CW ? GX2_FRONT_FACE_CW : GX2_FRONT_FACE_CCW;
 }
 
+static uint8_t clamp_clear_unorm8(float value) {
+  if (value <= 0.0f) return 0;
+  if (value >= 1.0f) return 255;
+  return (uint8_t)(value * 255.0f + 0.5f);
+}
+
+static bool cpu_clear_draw_color_buffer(GLuint index, const GLfloat *clear_color) {
+  GX2ColorBuffer *cb;
+  GX2Surface *surface;
+  GLint x0;
+  GLint y0;
+  GLint x1;
+  GLint y1;
+  uint8_t r8;
+  uint8_t g8;
+  uint8_t b8;
+  uint8_t a8;
+
+  if (!g_gl_context || !clear_color || g_gl_context->bound_framebuffer == 0) {
+    return false;
+  }
+  if (!gl_is_draw_color_buffer_enabled(index)) {
+    return true;
+  }
+
+  cb = gl_get_draw_color_buffer(index);
+  if (!cb || !cb->surface.image) {
+    return false;
+  }
+
+  surface = &cb->surface;
+  if (surface->tileMode != GX2_TILE_MODE_LINEAR_ALIGNED) {
+    return false;
+  }
+
+  x0 = 0;
+  y0 = 0;
+  x1 = (GLint)surface->width;
+  y1 = (GLint)surface->height;
+  if (g_gl_context->scissor_test_enabled) {
+    x0 = g_gl_context->scissor.x;
+    y0 = g_gl_context->scissor.y;
+    x1 = g_gl_context->scissor.x + g_gl_context->scissor.width;
+    y1 = g_gl_context->scissor.y + g_gl_context->scissor.height;
+  }
+
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > (GLint)surface->width) x1 = (GLint)surface->width;
+  if (y1 > (GLint)surface->height) y1 = (GLint)surface->height;
+  if (x0 >= x1 || y0 >= y1) {
+    return true;
+  }
+
+  r8 = clamp_clear_unorm8(clear_color[0]);
+  g8 = clamp_clear_unorm8(clear_color[1]);
+  b8 = clamp_clear_unorm8(clear_color[2]);
+  a8 = clamp_clear_unorm8(clear_color[3]);
+
+  for (GLint gl_y = y0; gl_y < y1; ++gl_y) {
+    uint32_t surface_y = (uint32_t)gl_y;
+    for (GLint gl_x = x0; gl_x < x1; ++gl_x) {
+      switch (surface->format) {
+      case GX2_SURFACE_FORMAT_UNORM_R8: {
+        uint8_t *dst = (uint8_t *)surface->image +
+                       (size_t)surface_y * (size_t)surface->pitch +
+                       (size_t)gl_x;
+        dst[0] = r8;
+        break;
+      }
+      case GX2_SURFACE_FORMAT_UNORM_R8_G8: {
+        uint8_t *dst = (uint8_t *)surface->image +
+                       (((size_t)surface_y * (size_t)surface->pitch) +
+                        (size_t)gl_x) * 2u;
+        dst[0] = r8;
+        dst[1] = g8;
+        break;
+      }
+      case GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8: {
+        uint32_t packed = CPU_TO_GPU_32(((uint32_t)r8 << 24) |
+                                        ((uint32_t)g8 << 16) |
+                                        ((uint32_t)b8 << 8) |
+                                        (uint32_t)a8);
+        uint8_t *dst = (uint8_t *)surface->image +
+                       (((size_t)surface_y * (size_t)surface->pitch) +
+                        (size_t)gl_x) * 4u;
+        memcpy(dst, &packed, sizeof(packed));
+        break;
+      }
+      default:
+        return false;
+      }
+    }
+  }
+
+  DCFlushRange(surface->image, surface->imageSize);
+  GX2Invalidate((GX2InvalidateMode)(GX2_INVALIDATE_MODE_COLOR_BUFFER |
+                                    GX2_INVALIDATE_MODE_TEXTURE),
+                surface->image, surface->imageSize);
+  return true;
+}
+
 void _gl_ClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {
   if (g_gl_context) {
     g_gl_context->clear_color[0] = red; g_gl_context->clear_color[1] = green;
@@ -119,17 +222,35 @@ void _gl_ClearStencil(GLint s) { if (g_gl_context) g_gl_context->clear_stencil =
 
 void _gl_Clear(GLbitfield mask) {
   if (!g_gl_context) return;
+  if ((mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0) {
+    _gl_set_error(GL_INVALID_VALUE);
+    return;
+  }
   gl_flush_state();
   if (mask & GL_COLOR_BUFFER_BIT) {
-    GX2ColorBuffer *cb = gl_get_draw_color_buffer(0);
-    if (cb) GX2ClearColor(cb, g_gl_context->clear_color[0], g_gl_context->clear_color[1],
-                          g_gl_context->clear_color[2], g_gl_context->clear_color[3]);
+    for (GLuint i = 0; i < 8; ++i) {
+      GX2ColorBuffer *cb;
+      if (!gl_is_draw_color_buffer_enabled(i)) continue;
+      if (!cpu_clear_draw_color_buffer(i, g_gl_context->clear_color)) {
+        cb = gl_get_draw_color_buffer(i);
+        if (!cb) continue;
+        GX2ClearColor(cb, g_gl_context->clear_color[0], g_gl_context->clear_color[1],
+                      g_gl_context->clear_color[2], g_gl_context->clear_color[3]);
+      }
+    }
+    gl_framebuffer_mark_bound_color_dirty();
   }
   if ((mask & GL_DEPTH_BUFFER_BIT) || (mask & GL_STENCIL_BUFFER_BIT)) {
+    GX2ClearFlags flags = GX2_CLEAR_FLAGS_BOTH;
     GX2DepthBuffer *db = gl_get_draw_depth_buffer();
+    if (mask & GL_DEPTH_BUFFER_BIT) {
+      flags = (mask & GL_STENCIL_BUFFER_BIT) ? GX2_CLEAR_FLAGS_BOTH : GX2_CLEAR_FLAGS_DEPTH;
+    } else {
+      flags = GX2_CLEAR_FLAGS_STENCIL;
+    }
     if (db) GX2ClearDepthStencilEx(db, (mask & GL_DEPTH_BUFFER_BIT) ? g_gl_context->clear_depth : db->depthClear,
                                  (mask & GL_STENCIL_BUFFER_BIT) ? (uint8_t)g_gl_context->clear_stencil : (uint8_t)db->stencilClear,
-                                 GX2_CLEAR_FLAGS_BOTH);
+                                 flags);
   }
 }
 
@@ -201,19 +322,19 @@ void _gl_LineWidth(GLfloat width) {
 }
 
 void _gl_Viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
-  if (g_gl_context) {
-    g_gl_context->viewport.x = x; g_gl_context->viewport.y = y;
-    g_gl_context->viewport.width = width; g_gl_context->viewport.height = height;
-    g_gl_context->dirty_flags |= GL_DIRTY_VIEWPORT;
-  }
+  if (!g_gl_context) return;
+  if (width < 0 || height < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+  g_gl_context->viewport.x = x; g_gl_context->viewport.y = y;
+  g_gl_context->viewport.width = width; g_gl_context->viewport.height = height;
+  g_gl_context->dirty_flags |= GL_DIRTY_VIEWPORT;
 }
 
 void _gl_Scissor(GLint x, GLint y, GLsizei width, GLsizei height) {
-  if (g_gl_context) {
-    g_gl_context->scissor.x = x; g_gl_context->scissor.y = y;
-    g_gl_context->scissor.width = width; g_gl_context->scissor.height = height;
-    g_gl_context->dirty_flags |= GL_DIRTY_SCISSOR;
-  }
+  if (!g_gl_context) return;
+  if (width < 0 || height < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+  g_gl_context->scissor.x = x; g_gl_context->scissor.y = y;
+  g_gl_context->scissor.width = width; g_gl_context->scissor.height = height;
+  g_gl_context->dirty_flags |= GL_DIRTY_SCISSOR;
 }
 
 void _gl_ColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
@@ -224,12 +345,79 @@ void _gl_ColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alp
   }
 }
 
-void _gl_Hint(GLenum target, GLenum mode) { (void)target; (void)mode; }
+void _gl_Hint(GLenum target, GLenum mode) {
+  if (!g_gl_context) return;
+  if (mode != GL_DONT_CARE && mode != GL_FASTEST && mode != GL_NICEST) {
+    _gl_set_error(GL_INVALID_ENUM);
+    return;
+  }
+
+  switch (target) {
+  case GL_GENERATE_MIPMAP_HINT:
+    g_gl_context->generate_mipmap_hint = mode;
+    break;
+  default:
+    _gl_set_error(GL_INVALID_ENUM);
+    break;
+  }
+}
 void _gl_PixelStorei(GLenum pname, GLint param) {
   if (!g_gl_context) return;
   switch (pname) {
-  case GL_PACK_ALIGNMENT: g_gl_context->pack_alignment = param; break;
-  case GL_UNPACK_ALIGNMENT: g_gl_context->unpack_alignment = param; break;
+  case GL_PACK_ALIGNMENT:
+    if (param != 1 && param != 2 && param != 4 && param != 8) {
+      _gl_set_error(GL_INVALID_VALUE);
+      return;
+    }
+    g_gl_context->pack_alignment = param;
+    break;
+  case GL_UNPACK_ALIGNMENT:
+    if (param != 1 && param != 2 && param != 4 && param != 8) {
+      _gl_set_error(GL_INVALID_VALUE);
+      return;
+    }
+    g_gl_context->unpack_alignment = param;
+    break;
+  case GL_PACK_ROW_LENGTH:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->pack_row_length = param;
+    break;
+  case GL_PACK_SKIP_ROWS:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->pack_skip_rows = param;
+    break;
+  case GL_PACK_SKIP_PIXELS:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->pack_skip_pixels = param;
+    break;
+  case GL_PACK_IMAGE_HEIGHT:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->pack_image_height = param;
+    break;
+  case GL_PACK_SKIP_IMAGES:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->pack_skip_images = param;
+    break;
+  case GL_UNPACK_ROW_LENGTH:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->unpack_row_length = param;
+    break;
+  case GL_UNPACK_SKIP_ROWS:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->unpack_skip_rows = param;
+    break;
+  case GL_UNPACK_SKIP_PIXELS:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->unpack_skip_pixels = param;
+    break;
+  case GL_UNPACK_IMAGE_HEIGHT:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->unpack_image_height = param;
+    break;
+  case GL_UNPACK_SKIP_IMAGES:
+    if (param < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    g_gl_context->unpack_skip_images = param;
+    break;
   default: _gl_set_error(GL_INVALID_ENUM); break;
   }
 }
@@ -304,28 +492,72 @@ void gl_flush_state(void) {
   if (!g_gl_context) return;
   bool valid;
 
+  // gx2gl currently does not expose legacy alpha-test state, so keep it
+  // explicitly disabled to avoid inheriting a previous GX2 context's discard
+  // configuration and silently dropping every fragment.
+  GX2SetAlphaTest(GX2_DISABLE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
+  GX2SetAlphaToMask(GX2_DISABLE, GX2_ALPHA_TO_MASK_MODE_NON_DITHERED);
+
+  if (g_gl_context->dirty_flags & GL_DIRTY_FRAMEBUFFER) {
+    gl_bind_framebuffers();
+  }
   if (g_gl_context->dirty_flags & GL_DIRTY_VIEWPORT) {
-    GX2SetViewport((float)g_gl_context->viewport.x, (float)g_gl_context->viewport.y,
+    GX2ColorBuffer *cb = gl_get_draw_color_buffer(0);
+    float rt_height = cb ? (float)cb->surface.height : (float)g_gl_context->viewport.height;
+    float flipped_y = rt_height - (float)g_gl_context->viewport.y - (float)g_gl_context->viewport.height;
+    GX2SetViewport((float)g_gl_context->viewport.x, flipped_y,
                    (float)g_gl_context->viewport.width, (float)g_gl_context->viewport.height,
                    g_gl_context->viewport.near_z, g_gl_context->viewport.far_z);
   }
-  if (g_gl_context->dirty_flags & GL_DIRTY_SCISSOR) {
-    GX2SetScissor((uint32_t)g_gl_context->scissor.x, (uint32_t)g_gl_context->scissor.y,
-                  (uint32_t)g_gl_context->scissor.width, (uint32_t)g_gl_context->scissor.height);
+  if (g_gl_context->dirty_flags & (GL_DIRTY_SCISSOR | GL_DIRTY_FRAMEBUFFER)) {
+    GX2ColorBuffer *cb = gl_get_draw_color_buffer(0);
+    if (g_gl_context->scissor_test_enabled) {
+      uint32_t rt_height = cb ? cb->surface.height : (uint32_t)g_gl_context->scissor.height;
+      uint32_t flipped_y = rt_height - (uint32_t)g_gl_context->scissor.y - (uint32_t)g_gl_context->scissor.height;
+      GX2SetScissor((uint32_t)g_gl_context->scissor.x, flipped_y,
+                    (uint32_t)g_gl_context->scissor.width, (uint32_t)g_gl_context->scissor.height);
+    } else {
+      uint32_t rt_width = cb ? cb->surface.width : (uint32_t)g_gl_context->viewport.width;
+      uint32_t rt_height = cb ? cb->surface.height : (uint32_t)g_gl_context->viewport.height;
+      GX2SetScissor(0, 0, rt_width, rt_height);
+    }
   }
   if (g_gl_context->dirty_flags & GL_DIRTY_BLEND) {
-    GX2BlendMode src_rgb   = map_blend_factor(g_gl_context->blend_src_rgb,   &valid);
-    GX2BlendMode dst_rgb   = map_blend_factor(g_gl_context->blend_dst_rgb,   &valid);
-    GX2BlendMode src_alpha = map_blend_factor(g_gl_context->blend_src_alpha, &valid);
-    GX2BlendMode dst_alpha = map_blend_factor(g_gl_context->blend_dst_alpha, &valid);
-    GX2BlendCombineMode eq_rgb   = map_blend_eq(g_gl_context->blend_eq_rgb,   &valid);
-    GX2BlendCombineMode eq_alpha = map_blend_eq(g_gl_context->blend_eq_alpha, &valid);
-    GX2SetBlendControl(GX2_RENDER_TARGET_0,
-                       src_rgb, dst_rgb, eq_rgb,
-                       GX2_ENABLE,
-                       src_alpha, dst_alpha, eq_alpha);
-    GX2SetBlendConstantColor(g_gl_context->blend_color[0], g_gl_context->blend_color[1],
-                             g_gl_context->blend_color[2], g_gl_context->blend_color[3]);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY,
+                       g_gl_context->blend_enabled ? 0xFF : 0x00,
+                       GX2_FALSE,
+                       GX2_TRUE);
+    if (g_gl_context->blend_enabled) {
+      GX2BlendMode src_rgb   = map_blend_factor(g_gl_context->blend_src_rgb,   &valid);
+      GX2BlendMode dst_rgb   = map_blend_factor(g_gl_context->blend_dst_rgb,   &valid);
+      GX2BlendMode src_alpha = map_blend_factor(g_gl_context->blend_src_alpha, &valid);
+      GX2BlendMode dst_alpha = map_blend_factor(g_gl_context->blend_dst_alpha, &valid);
+      GX2BlendCombineMode eq_rgb   = map_blend_eq(g_gl_context->blend_eq_rgb,   &valid);
+      GX2BlendCombineMode eq_alpha = map_blend_eq(g_gl_context->blend_eq_alpha, &valid);
+      GX2SetBlendControl(GX2_RENDER_TARGET_0,
+                         src_rgb, dst_rgb, eq_rgb,
+                         GX2_ENABLE,
+                         src_alpha, dst_alpha, eq_alpha);
+      GX2SetBlendConstantColor(g_gl_context->blend_color[0], g_gl_context->blend_color[1],
+                               g_gl_context->blend_color[2], g_gl_context->blend_color[3]);
+    }
+  }
+  if (g_gl_context->dirty_flags & GL_DIRTY_COLOR_MASK) {
+    uint8_t mask = 0;
+    if (g_gl_context->color_mask[0]) mask |= GX2_CHANNEL_MASK_R;
+    if (g_gl_context->color_mask[1]) mask |= GX2_CHANNEL_MASK_G;
+    if (g_gl_context->color_mask[2]) mask |= GX2_CHANNEL_MASK_B;
+    if (g_gl_context->color_mask[3]) mask |= GX2_CHANNEL_MASK_A;
+    GX2SetTargetChannelMasks((GX2ChannelMask)mask, (GX2ChannelMask)mask,
+                             (GX2ChannelMask)mask, (GX2ChannelMask)mask,
+                             (GX2ChannelMask)mask, (GX2ChannelMask)mask,
+                             (GX2ChannelMask)mask, (GX2ChannelMask)mask);
+  }
+  if (g_gl_context->dirty_flags & GL_DIRTY_LOGIC_OP) {
+    GX2SetColorControl(map_logic_op(g_gl_context->logic_op),
+                       g_gl_context->blend_enabled ? 0xFF : 0x00,
+                       GX2_FALSE,
+                       GX2_TRUE);
   }
   if (g_gl_context->dirty_flags & GL_DIRTY_DEPTH_STENCIL) {
     GX2CompareFunction depth_func = map_compare_func(g_gl_context->depth_func, &valid);
@@ -376,9 +608,13 @@ void gl_flush_state(void) {
       GX2SetPolygonOffset(g_gl_context->polygon_offset_factor, g_gl_context->polygon_offset_units,
                           g_gl_context->polygon_offset_factor, g_gl_context->polygon_offset_units, 0.0f);
   }
-  gl_bind_vao();
+  if (!(g_gl_context->dirty_flags & GL_DIRTY_FRAMEBUFFER)) {
+    gl_bind_framebuffers();
+  }
   gl_bind_shaders();
-  gl_bind_framebuffers();
+  gl_bind_program_fetch_shader();
+  gl_bind_textures();
+  gl_bind_vao();
   g_gl_context->dirty_flags = 0;
 }
 

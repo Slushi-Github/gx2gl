@@ -8,6 +8,18 @@
 extern "C" {
 #endif
 
+typedef struct {
+    GLuint buffer;
+    GLint size;
+    GLenum type;
+    GLboolean normalized;
+    GLboolean enabled;
+    GLboolean integer_input;
+    GLsizei stride;
+    const GLvoid *pointer;
+    GLuint divisor;
+} gl_vao_attrib_state_t;
+
 void gl_vao_init(void);
 
 void _gl_GenVertexArrays(GLsizei n, GLuint *arrays);
@@ -53,6 +65,8 @@ void _gl_VertexAttribDivisor(GLuint index, GLuint divisor);
 
 void gl_vao_set_element_array_buffer(GLuint buffer);
 GLuint gl_vao_get_element_array_buffer(void);
+void gl_vao_unbind_buffer(GLuint buffer);
+GLboolean gl_vao_get_attrib_state(GLuint index, gl_vao_attrib_state_t *state);
 
 void gl_bind_vao(void);
 

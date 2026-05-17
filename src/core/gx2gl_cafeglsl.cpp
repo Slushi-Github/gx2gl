@@ -1,7 +1,10 @@
 #include "gx2gl_cafeglsl.h"
 
+#include <stdio.h>
+
 extern "C" {
 #include <coreinit/dynload.h>
+#include <coreinit/debug.h>
 }
 
 typedef void (*gx2gl_cafeglsl_init_fn)(void);
@@ -19,11 +22,11 @@ typedef struct {
     gx2gl_cafeglsl_free_vs_fn free_vertex_shader;
     gx2gl_cafeglsl_free_ps_fn free_pixel_shader;
     gx2gl_cafeglsl_destroy_fn destroy;
-    bool attempted_init;
     bool available;
 } GX2GLCafeGLSLState;
 
 static GX2GLCafeGLSLState g_cafeglsl_state = {0};
+static char g_cafeglsl_last_error[256] = {0};
 
 static bool gx2gl_cafeglsl_load_exports(OSDynLoad_Module module) {
     if (OSDynLoad_FindExport(module, OS_DYNLOAD_EXPORT_FUNC, "InitGLSLCompiler",
@@ -56,35 +59,49 @@ static bool gx2gl_cafeglsl_load_exports(OSDynLoad_Module module) {
 
 bool gx2gl_cafeglsl_init(void) {
     static const char *const candidates[] = {
-        "glslcompiler",
-        "glslcompiler.rpl",
         "/vol/content/glslcompiler.rpl",
+        "/vol/content/wuhb-content/glslcompiler.rpl",
+        "./content/glslcompiler.rpl",
+        "./wuhb-content/glslcompiler.rpl",
+        "/vol/code/glslcompiler.rpl",
         "./glslcompiler.rpl",
+        "glslcompiler.rpl",
+        "glslcompiler",
+        "/vol/external01/glslcompiler.rpl",
+        "/vol/external01/wiiu/libs/glslcompiler",
+        "/vol/external01/wiiu/libs/glslcompiler.rpl",
         "~/wiiu/libs/glslcompiler.rpl",
     };
 
     if (g_cafeglsl_state.available) {
         return true;
     }
-    if (g_cafeglsl_state.attempted_init) {
-        return false;
-    }
-
-    g_cafeglsl_state.attempted_init = true;
+    snprintf(g_cafeglsl_last_error, sizeof(g_cafeglsl_last_error),
+             "CafeGLSL compiler unavailable.");
 
     for (unsigned i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); ++i) {
         if (OSDynLoad_Acquire(candidates[i], &g_cafeglsl_state.module) == OS_DYNLOAD_OK) {
             if (gx2gl_cafeglsl_load_exports(g_cafeglsl_state.module)) {
                 g_cafeglsl_state.init();
                 g_cafeglsl_state.available = true;
+                g_cafeglsl_last_error[0] = '\0';
+                OSReport("[gx2gl] CafeGLSL runtime compiler loaded from '%s'\n", candidates[i]);
                 return true;
             }
 
+            snprintf(g_cafeglsl_last_error, sizeof(g_cafeglsl_last_error),
+                     "Loaded CafeGLSL candidate '%s' but required exports were missing.",
+                     candidates[i]);
             OSDynLoad_Release(g_cafeglsl_state.module);
             g_cafeglsl_state.module = NULL;
+        } else {
+            snprintf(g_cafeglsl_last_error, sizeof(g_cafeglsl_last_error),
+                     "OSDynLoad_Acquire failed for CafeGLSL candidate '%s'.",
+                     candidates[i]);
         }
     }
 
+    OSReport("[gx2gl] CafeGLSL runtime compiler unavailable: %s\n", g_cafeglsl_last_error);
     return false;
 }
 
@@ -107,6 +124,11 @@ GX2VertexShader *gx2gl_cafeglsl_compile_vertex_shader(const char *shader_source,
                                                       int info_log_max_length,
                                                       gx2gl_cafeglsl_flag_t flags) {
     if (!gx2gl_cafeglsl_init()) {
+        if (info_log_out && info_log_max_length > 0) {
+            snprintf(info_log_out, (size_t)info_log_max_length, "%s",
+                     g_cafeglsl_last_error[0] ? g_cafeglsl_last_error
+                                              : "CafeGLSL compiler unavailable.");
+        }
         return NULL;
     }
 
@@ -119,6 +141,11 @@ GX2PixelShader *gx2gl_cafeglsl_compile_pixel_shader(const char *shader_source,
                                                     int info_log_max_length,
                                                     gx2gl_cafeglsl_flag_t flags) {
     if (!gx2gl_cafeglsl_init()) {
+        if (info_log_out && info_log_max_length > 0) {
+            snprintf(info_log_out, (size_t)info_log_max_length, "%s",
+                     g_cafeglsl_last_error[0] ? g_cafeglsl_last_error
+                                              : "CafeGLSL compiler unavailable.");
+        }
         return NULL;
     }
 

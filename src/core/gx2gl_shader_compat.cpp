@@ -426,6 +426,130 @@ static std::string join_lines(const std::vector<std::string> &lines) {
   return rebuilt;
 }
 
+static std::string normalize_version_directive(const std::string &line) {
+  size_t cursor = skip_whitespace(line, 0);
+  size_t comment_pos;
+  std::string prefix;
+  std::string directive;
+  std::string suffix;
+  size_t token_pos;
+
+  if (cursor >= line.size() || line.compare(cursor, 8, "#version") != 0) {
+    return line;
+  }
+
+  comment_pos = line.find("//", cursor);
+  prefix = line.substr(0, cursor);
+  if (comment_pos == std::string::npos) {
+    directive = line.substr(cursor);
+  } else {
+    directive = line.substr(cursor, comment_pos - cursor);
+    suffix = line.substr(comment_pos);
+  }
+
+  token_pos = directive.find(" core");
+  if (token_pos != std::string::npos) {
+    directive.erase(token_pos, 5);
+  }
+  token_pos = directive.find(" compatibility");
+  if (token_pos != std::string::npos) {
+    directive.erase(token_pos, 14);
+  }
+
+  return prefix + directive + suffix;
+}
+
+static bool is_fragment_color_type(const std::string &type) {
+  return type == "vec4";
+}
+
+static void replace_identifier(std::string *line,
+                               const std::string &from,
+                               const std::string &to) {
+  std::string replaced;
+  size_t cursor = 0;
+
+  if (!line || from.empty()) {
+    return;
+  }
+
+  while (cursor < line->size()) {
+    size_t found = line->find(from, cursor);
+    if (found == std::string::npos) {
+      replaced.append(*line, cursor, std::string::npos);
+      break;
+    }
+
+    bool left_boundary = found == 0 || !is_identifier_char((*line)[found - 1]);
+    size_t right = found + from.size();
+    bool right_boundary = right >= line->size() || !is_identifier_char((*line)[right]);
+    if (left_boundary && right_boundary) {
+      replaced.append(*line, cursor, found - cursor);
+      replaced += to;
+      cursor = right;
+    } else {
+      replaced.append(*line, cursor, (found + 1u) - cursor);
+      cursor = found + 1u;
+    }
+  }
+
+  *line = replaced;
+}
+
+static bool parse_interface_declaration(const std::string &line,
+                                        std::string *storage,
+                                        std::string *type,
+                                        std::string *name) {
+  size_t cursor = 0;
+
+  if (consume_keyword(line, &cursor, "layout")) {
+    size_t paren_end = line.find(')', cursor);
+    if (paren_end == std::string::npos) {
+      return false;
+    }
+    cursor = paren_end + 1u;
+  }
+
+  while (consume_keyword(line, &cursor, "flat") ||
+         consume_keyword(line, &cursor, "smooth") ||
+         consume_keyword(line, &cursor, "noperspective") ||
+         consume_keyword(line, &cursor, "centroid") ||
+         consume_keyword(line, &cursor, "invariant")) {
+  }
+
+  if (consume_keyword(line, &cursor, "in")) {
+    if (storage) {
+      *storage = "in";
+    }
+  } else if (consume_keyword(line, &cursor, "out")) {
+    if (storage) {
+      *storage = "out";
+    }
+  } else {
+    return false;
+  }
+
+  if (!consume_identifier(line, &cursor, type) ||
+      !consume_identifier(line, &cursor, name)) {
+    return false;
+  }
+
+  cursor = skip_whitespace(line, cursor);
+  if (cursor < line.size() && line[cursor] == '[') {
+    size_t bracket_end = line.find(']', cursor);
+    if (bracket_end == std::string::npos) {
+      return false;
+    }
+    cursor = skip_whitespace(line, bracket_end + 1u);
+  }
+
+  if (cursor >= line.size() || line[cursor] != ';') {
+    return false;
+  }
+
+  return true;
+}
+
 } // namespace
 
 char *gx2gl_prepare_shader_source_for_cafeglsl(const char *source,
@@ -436,6 +560,7 @@ char *gx2gl_prepare_shader_source_for_cafeglsl(const char *source,
   std::unordered_set<uint32_t> used_fragment_locations;
   uint32_t next_sampler_binding = 0u;
   uint32_t next_fragment_location = 0u;
+  std::string primary_fragment_output_name;
   std::string rebuilt_source;
   char *prepared_source;
 
@@ -444,6 +569,9 @@ char *gx2gl_prepare_shader_source_for_cafeglsl(const char *source,
   }
 
   lines = split_lines(source);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    lines[i] = normalize_version_directive(lines[i]);
+  }
   pre_scan_shader_source(lines, shader_type, &sampler_bindings, &next_sampler_binding,
                          &fragment_outputs, &used_fragment_locations,
                          &next_fragment_location);
@@ -471,28 +599,15 @@ char *gx2gl_prepare_shader_source_for_cafeglsl(const char *source,
       }
       after_uniform = skip_whitespace(line, after_uniform);
       if (after_uniform >= line.size() || line[after_uniform] == '{') {
-        if (!has_layout_key(line, "binding")) {
-          uint32_t block_binding = 0u;
-          if (type == "Matrices") {
-            block_binding = 0u;
-          } else if (type == "LightingData") {
-            block_binding = 1u;
-          } else if (type == "SPFogData") {
-            block_binding = 2u;
-          } else {
-            continue;
-          }
-          line = add_layout_qualifier(line, "binding = " + std::to_string(block_binding));
-        }
+        /* CafeGLSL rejects modern layout(binding=...) syntax. gx2gl rebuilds
+         * block binding state from shader reflection after compilation, so we
+         * can keep the source block declarations untouched here. */
         continue;
       }
 
-      if (type.compare(0, 7, "sampler") == 0 && consume_identifier(line, &after_uniform, &name) &&
-          !has_layout_key(line, "binding")) {
-        uint32_t binding =
-            assign_local_binding(&sampler_bindings, &next_sampler_binding, name);
-        line = add_layout_qualifier(line, "binding = " + std::to_string(binding));
-      }
+      /* CafeGLSL also rejects sampler layout(binding=...). Runtime sampler
+       * bindings are tracked separately from reflection, so leave sampler
+       * uniforms untouched. */
       continue;
     }
 
@@ -516,44 +631,45 @@ char *gx2gl_prepare_shader_source_for_cafeglsl(const char *source,
       continue;
     }
 
-    size_t storage_cursor = 0;
-    if (consume_keyword(line, &storage_cursor, "layout")) {
-      size_t paren_end = line.find(')', storage_cursor);
-      if (paren_end != std::string::npos) {
-        storage_cursor = paren_end + 1;
+    if (!parse_interface_declaration(line, &storage, &type, &name)) {
+      continue;
+    }
+
+    if (shader_type == GL_FRAGMENT_SHADER && storage == "out" &&
+        is_fragment_color_type(type)) {
+      uint32_t location;
+      if (has_layout_key(line, "location")) {
+        int explicit_location = extract_layout_integer(line, "location");
+        if (explicit_location < 0) {
+          continue;
+        }
+        location = (uint32_t)explicit_location;
+      } else {
+        location = assign_local_fragment_output(&fragment_outputs,
+                                                &used_fragment_locations,
+                                                &next_fragment_location,
+                                                name);
       }
-    }
-    while (consume_keyword(line, &storage_cursor, "flat") ||
-           consume_keyword(line, &storage_cursor, "smooth") ||
-           consume_keyword(line, &storage_cursor, "noperspective") ||
-           consume_keyword(line, &storage_cursor, "centroid") ||
-           consume_keyword(line, &storage_cursor, "invariant")) {
-    }
 
-    if (consume_keyword(line, &storage_cursor, "in")) {
-      storage = "in";
-    } else if (consume_keyword(line, &storage_cursor, "out")) {
-      storage = "out";
-    } else {
+      if (location == 0u && primary_fragment_output_name.empty()) {
+        primary_fragment_output_name = name;
+        line.clear();
+      }
       continue;
     }
 
-    if (!consume_identifier(line, &storage_cursor, &type) ||
-        !consume_identifier(line, &storage_cursor, &name) ||
-        has_layout_key(line, "location")) {
+    if (has_layout_key(line, "location")) {
       continue;
     }
 
-    if (shader_type == GL_VERTEX_SHADER && storage == "out") {
-      uint32_t location = assign_global_varying_location(name, -1);
-      line = add_layout_qualifier(line, "location = " + std::to_string(location));
-    } else if (shader_type == GL_FRAGMENT_SHADER && storage == "in") {
-      uint32_t location = assign_global_varying_location(name, -1);
-      line = add_layout_qualifier(line, "location = " + std::to_string(location));
-    } else if (shader_type == GL_FRAGMENT_SHADER && storage == "out") {
-      uint32_t location = assign_local_fragment_output(
-          &fragment_outputs, &used_fragment_locations, &next_fragment_location, name);
-      line = add_layout_qualifier(line, "location = " + std::to_string(location));
+    /* CafeGLSL's GLSL parser is stricter than desktop 3.3 and rejects the
+     * explicit varying/output location decorations we used to synthesize here.
+     * Stage matching still works by name, so keep these declarations plain. */
+  }
+
+  if (!primary_fragment_output_name.empty()) {
+    for (size_t line_index = 0; line_index < lines.size(); ++line_index) {
+      replace_identifier(&lines[line_index], primary_fragment_output_name, "gl_FragColor");
     }
   }
 

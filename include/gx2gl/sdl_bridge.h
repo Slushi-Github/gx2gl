@@ -18,6 +18,11 @@ void GX2GL_DeleteContext(GX2GL_Context context);
 int GX2GL_SetSwapInterval(int interval);
 int GX2GL_GetSwapInterval(void);
 int GX2GL_SwapWindow(void);
+int GX2GL_SetAutomaticDRCEnabled(int enabled);
+int GX2GL_GetAutomaticDRCEnabled(void);
+int GX2GL_SetDefaultFramebufferTargetDRC(int enabled);
+int GX2GL_GetDefaultFramebufferTargetDRC(void);
+int GX2GL_CopyToDRC(void);
 
 #ifdef __cplusplus
 }

@@ -3,16 +3,17 @@
 #include "endian/endian.h"
 #include "mem/gl_mem.h"
 #include "state/gl_state.h"
-#include <coreinit/cache.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
+#include <coreinit/cache.h>
 #include <gx2/surface.h>
 #include <gx2/state.h>
 #include <gx2/event.h>
 #include <gx2/display.h>
 #include <gx2/registers.h>
 #include <gx2/mem.h>
+#include <gx2r/surface.h>
 #include <whb/gfx.h>
 #ifdef __cplusplus
 }
@@ -20,6 +21,48 @@ extern "C" {
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
+
+#ifndef GL_TEXTURE_CUBE_MAP_POSITIVE_X
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_X 0x8515
+#endif
+
+#ifndef GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
+#define GL_TEXTURE_CUBE_MAP_NEGATIVE_Z 0x851A
+#endif
+#ifndef GL_QUERY_COUNTER_BITS
+#define GL_QUERY_COUNTER_BITS 0x8864
+#endif
+#ifndef GL_CURRENT_QUERY
+#define GL_CURRENT_QUERY 0x8865
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+#endif
+#ifndef GL_SAMPLES_PASSED
+#define GL_SAMPLES_PASSED 0x8914
+#endif
+#ifndef GL_ANY_SAMPLES_PASSED
+#define GL_ANY_SAMPLES_PASSED 0x8C2F
+#endif
+#ifndef GL_ANY_SAMPLES_PASSED_CONSERVATIVE
+#define GL_ANY_SAMPLES_PASSED_CONSERVATIVE 0x8D6A
+#endif
+#ifndef GL_QUERY_WAIT
+#define GL_QUERY_WAIT 0x8E13
+#endif
+#ifndef GL_QUERY_NO_WAIT
+#define GL_QUERY_NO_WAIT 0x8E14
+#endif
+#ifndef GL_QUERY_BY_REGION_WAIT
+#define GL_QUERY_BY_REGION_WAIT 0x8E15
+#endif
+#ifndef GL_QUERY_BY_REGION_NO_WAIT
+#define GL_QUERY_BY_REGION_NO_WAIT 0x8E16
+#endif
 
 #define MAX_FRAMEBUFFERS 128
 #define MAX_RENDERBUFFERS 256
@@ -34,6 +77,12 @@ typedef struct {
     GLAttachmentKind kind;
     GLuint object;
 } GLAttachmentRef;
+
+typedef struct {
+    bool allocated;
+    GX2Surface surface;
+    GX2ColorBuffer color_buffer;
+} GLTextureColorTarget;
 
 typedef struct {
     bool in_use;
@@ -55,12 +104,315 @@ typedef struct {
     GLAttachmentRef stencil_attachment;
 
     GX2ColorBuffer cb[8];
+    GLTextureColorTarget texture_targets[8];
+    bool color_needs_resolve[8];
     GX2DepthBuffer db;
     bool dirty;
 } GLFramebuffer;
 
 static GLFramebuffer g_framebuffers[MAX_FRAMEBUFFERS];
 static GLRenderbuffer g_renderbuffers[MAX_RENDERBUFFERS];
+static bool g_default_framebuffer_uses_drc = false;
+
+static bool attachment_ref_present(const GLAttachmentRef *attachment);
+static GLRenderbuffer *get_renderbuffer(GLuint id);
+static GX2ColorBuffer *get_default_color_buffer(void);
+static void clear_attachment_ref(GLAttachmentRef *attachment);
+
+static bool is_query_target(GLenum target) {
+    return target == GL_SAMPLES_PASSED ||
+           target == GL_ANY_SAMPLES_PASSED ||
+           target == GL_ANY_SAMPLES_PASSED_CONSERVATIVE ||
+           target == GL_TIME_ELAPSED;
+}
+
+static bool is_query_pname(GLenum pname) {
+    return pname == GL_CURRENT_QUERY || pname == GL_QUERY_COUNTER_BITS;
+}
+
+static bool is_query_object_pname(GLenum pname) {
+    return pname == GL_QUERY_RESULT || pname == GL_QUERY_RESULT_AVAILABLE;
+}
+
+static bool is_conditional_render_mode(GLenum mode) {
+    return mode == GL_QUERY_WAIT ||
+           mode == GL_QUERY_NO_WAIT ||
+           mode == GL_QUERY_BY_REGION_WAIT ||
+           mode == GL_QUERY_BY_REGION_NO_WAIT;
+}
+
+static void detach_renderbuffer_from_framebuffers(GLuint renderbuffer) {
+    if (renderbuffer == 0) return;
+
+    for (uint32_t i = 0; i < MAX_FRAMEBUFFERS; ++i) {
+        GLFramebuffer *fb = &g_framebuffers[i];
+        bool detached = false;
+
+        if (!fb->in_use) continue;
+
+        for (uint32_t j = 0; j < 8; ++j) {
+            if (fb->color_attachments[j].kind == GL_ATTACHMENT_KIND_RENDERBUFFER &&
+                fb->color_attachments[j].object == renderbuffer) {
+                clear_attachment_ref(&fb->color_attachments[j]);
+                fb->color_needs_resolve[j] = false;
+                memset(&fb->cb[j], 0, sizeof(fb->cb[j]));
+                detached = true;
+            }
+        }
+
+        if (fb->depth_attachment.kind == GL_ATTACHMENT_KIND_RENDERBUFFER &&
+            fb->depth_attachment.object == renderbuffer) {
+            clear_attachment_ref(&fb->depth_attachment);
+            memset(&fb->db, 0, sizeof(fb->db));
+            detached = true;
+        }
+
+        if (fb->stencil_attachment.kind == GL_ATTACHMENT_KIND_RENDERBUFFER &&
+            fb->stencil_attachment.object == renderbuffer) {
+            clear_attachment_ref(&fb->stencil_attachment);
+            memset(&fb->db, 0, sizeof(fb->db));
+            detached = true;
+        }
+
+        if (detached) {
+            fb->dirty = true;
+            if (g_gl_context &&
+                (g_gl_context->bound_framebuffer == i ||
+                 g_gl_context->bound_read_framebuffer == i)) {
+                g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
+            }
+        }
+    }
+}
+
+static bool get_color_attachment_index(GLenum attachment, uint32_t *index) {
+    if (attachment < GL_COLOR_ATTACHMENT0 || attachment > GL_COLOR_ATTACHMENT7) {
+        return false;
+    }
+    if (index) {
+        *index = (uint32_t)(attachment - GL_COLOR_ATTACHMENT0);
+    }
+    return true;
+}
+
+static GX2RResourceFlags build_framebuffer_surface_flags(GLint internal_format,
+                                                         bool is_depth,
+                                                         bool sampled_texture) {
+    GX2RResourceFlags flags;
+
+    flags = (GX2RResourceFlags)(GX2R_RESOURCE_USAGE_CPU_WRITE |
+                                GX2R_RESOURCE_USAGE_CPU_READ |
+                                GX2R_RESOURCE_USAGE_GPU_READ |
+                                GX2R_RESOURCE_USAGE_GPU_WRITE |
+                                GX2R_RESOURCE_USAGE_FORCE_MEM2);
+
+    if (sampled_texture)
+        flags = (GX2RResourceFlags)(flags | GX2R_RESOURCE_BIND_TEXTURE);
+
+    if (is_depth) {
+        flags = (GX2RResourceFlags)(flags | GX2R_RESOURCE_BIND_DEPTH_BUFFER);
+    }
+    else {
+        flags = (GX2RResourceFlags)(flags | GX2R_RESOURCE_BIND_COLOR_BUFFER);
+    }
+
+    (void)internal_format;
+    return flags;
+}
+
+static void free_surface_storage(GX2Surface *surface) {
+    if (!surface) return;
+    if (surface->resourceFlags) {
+        GX2RDestroySurfaceEx(surface, GX2R_RESOURCE_BIND_NONE);
+        memset(surface, 0, sizeof(*surface));
+        return;
+    }
+    if (surface->image) gl_mem_free(GL_MEM_TYPE_MEM2, surface->image);
+    if (surface->mipmaps) gl_mem_free(GL_MEM_TYPE_MEM2, surface->mipmaps);
+    memset(surface, 0, sizeof(*surface));
+}
+
+static void free_color_buffer_aux(GX2ColorBuffer *color_buffer) {
+    if (!color_buffer) return;
+    if (color_buffer->aaBuffer) gl_mem_free(GL_MEM_TYPE_MEM2, color_buffer->aaBuffer);
+    color_buffer->aaBuffer = NULL;
+    color_buffer->aaSize = 0;
+}
+
+static void free_texture_color_target(GLTextureColorTarget *target) {
+    if (!target) return;
+    free_color_buffer_aux(&target->color_buffer);
+    if (target->allocated) free_surface_storage(&target->surface);
+    memset(target, 0, sizeof(*target));
+}
+
+static void free_framebuffer_texture_target(GLFramebuffer *fb, uint32_t index) {
+    if (!fb || index >= 8) return;
+    free_texture_color_target(&fb->texture_targets[index]);
+    fb->color_needs_resolve[index] = false;
+    free_color_buffer_aux(&fb->cb[index]);
+    memset(&fb->cb[index], 0, sizeof(fb->cb[index]));
+}
+
+static void invalidate_surface_after_color_write(const GX2Surface *surface) {
+    if (!surface) return;
+    if (surface->resourceFlags) {
+        GX2RInvalidateSurface((GX2Surface *)surface, 0,
+                              (GX2RResourceFlags)(GX2R_RESOURCE_USAGE_GPU_WRITE |
+                                                  GX2R_RESOURCE_USAGE_GPU_READ));
+        return;
+    }
+    if (surface->image && surface->imageSize) {
+        GX2Invalidate((GX2InvalidateMode)(GX2_INVALIDATE_MODE_COLOR_BUFFER |
+                                          GX2_INVALIDATE_MODE_TEXTURE),
+                      surface->image, surface->imageSize);
+    }
+    if (surface->mipmaps && surface->mipmapSize) {
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE,
+                      surface->mipmaps, surface->mipmapSize);
+    }
+}
+
+static bool stage_color_surface_for_cpu_read(const GX2Surface *source,
+                                             GLint internal_format,
+                                             GX2Surface *staging_surface) {
+    GX2RResourceFlags surface_flags;
+
+    if (!source || !source->image || !staging_surface) return false;
+
+    memset(staging_surface, 0, sizeof(*staging_surface));
+    staging_surface->dim = source->dim;
+    staging_surface->width = source->width;
+    staging_surface->height = source->height;
+    staging_surface->depth = source->depth ? source->depth : 1;
+    staging_surface->mipLevels = 1;
+    staging_surface->format = source->format;
+    staging_surface->aa = GX2_AA_MODE1X;
+    staging_surface->use = (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    staging_surface->tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(staging_surface);
+    surface_flags = build_framebuffer_surface_flags(internal_format, false, true);
+
+    if (!GX2RCreateSurface(staging_surface, surface_flags)) {
+        memset(staging_surface, 0, sizeof(*staging_surface));
+        return false;
+    }
+
+    GX2CopySurface(source, 0, 0, staging_surface, 0, 0);
+    GX2DrawDone();
+    invalidate_surface_after_color_write(staging_surface);
+    DCInvalidateRange(staging_surface->image, staging_surface->imageSize);
+    return true;
+}
+
+static bool init_color_buffer_from_surface(GX2ColorBuffer *cb, const GX2Surface *s) {
+    uint32_t aux_size = 0;
+    uint32_t aux_alignment = 0;
+
+    if (!cb || !s) return false;
+
+    free_color_buffer_aux(cb);
+
+    memset(cb, 0, sizeof(*cb));
+    cb->surface = *s;
+    cb->viewNumSlices = 1;
+
+    GX2CalcColorBufferAuxInfo(cb, &aux_size, &aux_alignment);
+    if (aux_size) {
+        cb->aaBuffer = gl_mem_alloc(GL_MEM_TYPE_MEM2, aux_size, aux_alignment ? aux_alignment : 0x100);
+        if (!cb->aaBuffer) {
+            memset(cb, 0, sizeof(*cb));
+            return false;
+        }
+
+        memset(cb->aaBuffer, 0, aux_size);
+        cb->aaSize = aux_size;
+    }
+
+    GX2InitColorBufferRegs(cb);
+    return true;
+}
+
+static bool ensure_texture_color_target(GLFramebuffer *fb, uint32_t index, const GX2Texture *texture) {
+    GLTextureColorTarget *target;
+    GX2Surface *surface;
+    GX2RResourceFlags surface_flags;
+
+    if (!fb || index >= 8 || !texture || !texture->surface.image) return false;
+
+    target = &fb->texture_targets[index];
+    surface = &target->surface;
+    if (target->allocated &&
+        surface->dim == texture->surface.dim &&
+        surface->width == texture->surface.width &&
+        surface->height == texture->surface.height &&
+        surface->depth == texture->surface.depth &&
+        surface->format == texture->surface.format) {
+        return true;
+    }
+
+    free_texture_color_target(target);
+
+    memset(surface, 0, sizeof(*surface));
+    surface->dim = texture->surface.dim;
+    surface->width = texture->surface.width;
+    surface->height = texture->surface.height;
+    surface->depth = texture->surface.depth ? texture->surface.depth : 1;
+    surface->mipLevels = 1;
+    surface->format = texture->surface.format;
+    surface->aa = GX2_AA_MODE1X;
+    surface->use = (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    surface->tileMode = GX2_TILE_MODE_DEFAULT;
+    GX2CalcSurfaceSizeAndAlignment(surface);
+    surface_flags = build_framebuffer_surface_flags(
+        gl_get_texture_internal_format(fb->color_attachments[index].object), false, true);
+
+    if (!GX2RCreateSurface(surface, surface_flags)) {
+        memset(surface, 0, sizeof(*surface));
+        return false;
+    }
+
+    if (surface->image && surface->imageSize)
+        memset(surface->image, 0, surface->imageSize);
+    if (surface->mipmaps && surface->mipmapSize)
+        memset(surface->mipmaps, 0, surface->mipmapSize);
+
+    if (!init_color_buffer_from_surface(&target->color_buffer, surface)) {
+        free_surface_storage(surface);
+        return false;
+    }
+
+    target->allocated = true;
+    return true;
+}
+
+static void resolve_framebuffer_texture_targets(GLFramebuffer *fb) {
+    if (!fb) return;
+    for (uint32_t i = 0; i < 8; ++i) {
+        GX2Texture *texture;
+        GLTextureColorTarget *target;
+        if (!fb->color_needs_resolve[i]) continue;
+        if (fb->color_attachments[i].kind != GL_ATTACHMENT_KIND_TEXTURE) {
+            fb->color_needs_resolve[i] = false;
+            continue;
+        }
+
+        texture = gl_get_gx2_texture(fb->color_attachments[i].object);
+        if (!texture || !texture->surface.image) {
+            fb->color_needs_resolve[i] = false;
+            continue;
+        }
+
+        target = &fb->texture_targets[i];
+        GX2DrawDone();
+        if (target->allocated && target->surface.image) {
+            GX2CopySurface(&target->surface, 0, 0, &texture->surface, 0, 0);
+            GX2DrawDone();
+        }
+        invalidate_surface_after_color_write(&texture->surface);
+        fb->color_needs_resolve[i] = false;
+    }
+}
 
 static void init_draw_buffer_defaults(GLFramebuffer *fb, bool is_default) {
     if (!fb) return;
@@ -75,6 +427,11 @@ static void init_read_buffer_default(GLFramebuffer *fb, bool is_default) {
 
 static bool is_framebuffer_target(GLenum target) {
     return target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER;
+}
+
+static bool is_cube_map_face_target(GLenum target) {
+    return target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
+           target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
 }
 
 static GLuint get_bound_framebuffer_for_target(GLenum target) {
@@ -121,6 +478,28 @@ static bool is_depth_internal_format(GLint internal_format) {
 
 static bool is_stencil_internal_format(GLint internal_format) {
     return internal_format == GL_DEPTH_STENCIL || internal_format == GL_DEPTH24_STENCIL8;
+}
+
+static GX2LogicOp map_framebuffer_logic_op(GLenum op) {
+    switch (op) {
+    case GL_CLEAR:         return GX2_LOGIC_OP_CLEAR;
+    case GL_SET:           return GX2_LOGIC_OP_SET;
+    case GL_COPY:          return GX2_LOGIC_OP_COPY;
+    case GL_COPY_INVERTED: return GX2_LOGIC_OP_INV_COPY;
+    case GL_NOOP:          return GX2_LOGIC_OP_NOP;
+    case GL_INVERT:        return GX2_LOGIC_OP_INV;
+    case GL_AND:           return GX2_LOGIC_OP_AND;
+    case GL_NAND:          return GX2_LOGIC_OP_NOT_AND;
+    case GL_OR:            return GX2_LOGIC_OP_OR;
+    case GL_NOR:           return GX2_LOGIC_OP_NOR;
+    case GL_XOR:           return GX2_LOGIC_OP_XOR;
+    case GL_EQUIV:         return GX2_LOGIC_OP_EQUIV;
+    case GL_AND_REVERSE:   return GX2_LOGIC_OP_REV_AND;
+    case GL_AND_INVERTED:  return GX2_LOGIC_OP_INV_AND;
+    case GL_OR_REVERSE:    return GX2_LOGIC_OP_REV_OR;
+    case GL_OR_INVERTED:   return GX2_LOGIC_OP_INV_OR;
+    default:               return GX2_LOGIC_OP_COPY;
+    }
 }
 
 static bool get_renderbuffer_format_info(GLenum internalformat, GX2SurfaceFormat *gx2_format, GX2SurfaceUse *surface_use, bool *is_depth) {
@@ -178,8 +557,10 @@ static void apply_framebuffer_output_state(GLFramebuffer *fb, bool is_default) {
     color_mask = build_color_channel_mask();
     for (uint32_t i = 0; i < 8; ++i) {
         bool enabled = false;
+        uint32_t attachment_index = 0;
         if (is_default) enabled = (i == 0 && fb->draw_buffers[0] == GL_BACK);
-        else if (fb->draw_buffers[i] == (GL_COLOR_ATTACHMENT0 + i) && attachment_ref_present(&fb->color_attachments[i])) enabled = true;
+        else if (get_color_attachment_index(fb->draw_buffers[i], &attachment_index) &&
+                 attachment_ref_present(&fb->color_attachments[attachment_index])) enabled = true;
         if (enabled && color_mask != 0) {
             masks[i] = color_mask;
             active_target_mask |= (uint8_t)(1u << i);
@@ -187,14 +568,10 @@ static void apply_framebuffer_output_state(GLFramebuffer *fb, bool is_default) {
         }
     }
     GX2SetTargetChannelMasks(masks[0], masks[1], masks[2], masks[3], masks[4], masks[5], masks[6], masks[7]);
-    GX2SetColorControl(GX2_LOGIC_OP_COPY, g_gl_context->blend_enabled ? active_target_mask : 0, active_target_count > 1 ? GX2_ENABLE : GX2_DISABLE, active_target_mask != 0 ? GX2_ENABLE : GX2_DISABLE);
-}
-
-static void init_color_buffer_from_surface(GX2ColorBuffer *cb, const GX2Surface *s) {
-    memset(cb, 0, sizeof(*cb));
-    cb->surface = *s;
-    cb->viewNumSlices = 1;
-    GX2InitColorBufferRegs(cb);
+    GX2SetColorControl(map_framebuffer_logic_op(g_gl_context->logic_op),
+                       g_gl_context->blend_enabled ? active_target_mask : 0,
+                       active_target_count > 1 ? GX2_ENABLE : GX2_DISABLE,
+                       active_target_mask != 0 ? GX2_ENABLE : GX2_DISABLE);
 }
 
 static void init_depth_buffer_from_surface(GX2DepthBuffer *db, const GX2Surface *s) {
@@ -205,10 +582,216 @@ static void init_depth_buffer_from_surface(GX2DepthBuffer *db, const GX2Surface 
     GX2InitDepthBufferRegs(db);
 }
 
+static bool get_attachment_surface_info(const GLAttachmentRef *attachment,
+                                        GLsizei *width,
+                                        GLsizei *height,
+                                        bool *is_depth) {
+    if (!attachment_ref_present(attachment) || !width || !height || !is_depth) return false;
+
+    if (attachment->kind == GL_ATTACHMENT_KIND_TEXTURE) {
+        GX2Texture *texture = gl_get_gx2_texture(attachment->object);
+        if (!texture || !texture->surface.image) return false;
+        *width = (GLsizei)texture->surface.width;
+        *height = (GLsizei)texture->surface.height;
+        *is_depth = is_depth_internal_format(gl_get_texture_internal_format(attachment->object));
+        return true;
+    }
+
+    if (attachment->kind == GL_ATTACHMENT_KIND_RENDERBUFFER) {
+        GLRenderbuffer *renderbuffer = get_renderbuffer(attachment->object);
+        if (!renderbuffer || !renderbuffer->surface.image) return false;
+        *width = renderbuffer->width;
+        *height = renderbuffer->height;
+        *is_depth = renderbuffer->is_depth;
+        return true;
+    }
+
+    return false;
+}
+
+static float decode_gpu_float32(const uint8_t *ptr) {
+    uint32_t word;
+    float value;
+
+    memcpy(&word, ptr, sizeof(word));
+    word = GPU_TO_CPU_32(word);
+    memcpy(&value, &word, sizeof(value));
+    return value;
+}
+
+static void encode_gpu_float32(uint8_t *ptr, float value) {
+    uint32_t word;
+
+    memcpy(&word, &value, sizeof(word));
+    word = CPU_TO_GPU_32(word);
+    memcpy(ptr, &word, sizeof(word));
+}
+
+static float decode_gpu_half_float(const uint8_t *ptr) {
+    uint16_t word;
+    uint32_t sign;
+    uint32_t exponent;
+    uint32_t mantissa;
+    uint32_t out_word;
+    float value;
+
+    memcpy(&word, ptr, sizeof(word));
+    word = GPU_TO_CPU_16(word);
+
+    sign = (uint32_t)(word & 0x8000u) << 16;
+    exponent = (word >> 10) & 0x1Fu;
+    mantissa = word & 0x03FFu;
+
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            out_word = sign;
+        } else {
+            exponent = 1;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                --exponent;
+            }
+            mantissa &= 0x03FFu;
+            out_word = sign | ((exponent + (127u - 15u)) << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        out_word = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        out_word = sign | ((exponent + (127u - 15u)) << 23) | (mantissa << 13);
+    }
+
+    memcpy(&value, &out_word, sizeof(value));
+    return value;
+}
+
+static uint8_t float_to_unorm8(float value) {
+    if (value <= 0.0f) return 0;
+    if (value >= 1.0f) return 255;
+    return (uint8_t)(value * 255.0f + 0.5f);
+}
+
+static GX2ColorBuffer *get_read_color_buffer(void) {
+    uint32_t attachment_index = 0;
+    GLuint fbo;
+
+    if (!g_gl_context) return NULL;
+
+    fbo = g_gl_context->bound_read_framebuffer;
+    if (fbo == 0) {
+        if (g_framebuffers[0].read_buffer != GL_BACK) return NULL;
+        return get_default_color_buffer();
+    }
+
+    if (fbo >= MAX_FRAMEBUFFERS || !g_framebuffers[fbo].in_use) return NULL;
+
+    if (g_gl_context->bound_framebuffer == fbo) {
+        gl_bind_framebuffers();
+    } else {
+        GLFramebuffer *fb = &g_framebuffers[fbo];
+        if (fb->dirty) {
+            for (uint32_t i = 0; i < 8; ++i) {
+                if (!attachment_ref_present(&fb->color_attachments[i])) {
+                    free_framebuffer_texture_target(fb, i);
+                    continue;
+                }
+                if (fb->color_attachments[i].kind == GL_ATTACHMENT_KIND_TEXTURE) {
+                    GX2Texture *t = gl_get_gx2_texture(fb->color_attachments[i].object);
+                    free_framebuffer_texture_target(fb, i);
+                    if (t) init_color_buffer_from_surface(&fb->cb[i], &t->surface);
+                } else {
+                    free_framebuffer_texture_target(fb, i);
+                    GLRenderbuffer *rb = get_renderbuffer(fb->color_attachments[i].object);
+                    if (rb && !rb->is_depth) fb->cb[i] = rb->color_buffer;
+                }
+            }
+            memset(&fb->db, 0, sizeof(fb->db));
+            if (attachment_ref_present(&fb->depth_attachment)) {
+                if (fb->depth_attachment.kind == GL_ATTACHMENT_KIND_TEXTURE) {
+                    GX2Texture *t = gl_get_gx2_texture(fb->depth_attachment.object);
+                    if (t) init_depth_buffer_from_surface(&fb->db, &t->surface);
+                } else {
+                    GLRenderbuffer *rb = get_renderbuffer(fb->depth_attachment.object);
+                    if (rb && rb->is_depth) fb->db = rb->depth_buffer;
+                }
+            } else if (attachment_ref_present(&fb->stencil_attachment)) {
+                if (fb->stencil_attachment.kind == GL_ATTACHMENT_KIND_TEXTURE) {
+                    GX2Texture *t = gl_get_gx2_texture(fb->stencil_attachment.object);
+                    if (t) init_depth_buffer_from_surface(&fb->db, &t->surface);
+                } else {
+                    GLRenderbuffer *rb = get_renderbuffer(fb->stencil_attachment.object);
+                    if (rb && rb->is_depth) fb->db = rb->depth_buffer;
+                }
+            }
+            fb->dirty = false;
+        }
+    }
+
+    resolve_framebuffer_texture_targets(&g_framebuffers[fbo]);
+
+    if (g_framebuffers[fbo].read_buffer == GL_NONE) return NULL;
+    if (!get_color_attachment_index(g_framebuffers[fbo].read_buffer, &attachment_index)) {
+        return NULL;
+    }
+
+    if (!attachment_ref_present(&g_framebuffers[g_gl_context->bound_read_framebuffer].color_attachments[attachment_index])) {
+        return NULL;
+    }
+    return &g_framebuffers[g_gl_context->bound_read_framebuffer].cb[attachment_index];
+}
+
+static GLint get_read_color_internal_format(void) {
+    GLuint fbo;
+    uint32_t attachment_index = 0;
+
+    if (!g_gl_context) return GL_RGBA8;
+
+    fbo = g_gl_context->bound_read_framebuffer;
+    if (fbo == 0) {
+        return GL_RGBA8;
+    }
+    if (fbo >= MAX_FRAMEBUFFERS || !g_framebuffers[fbo].in_use) {
+        return GL_RGBA8;
+    }
+    if (!get_color_attachment_index(g_framebuffers[fbo].read_buffer, &attachment_index)) {
+        return GL_RGBA8;
+    }
+
+    if (g_framebuffers[fbo].color_attachments[attachment_index].kind == GL_ATTACHMENT_KIND_TEXTURE) {
+        return gl_get_texture_internal_format(g_framebuffers[fbo].color_attachments[attachment_index].object);
+    }
+    if (g_framebuffers[fbo].color_attachments[attachment_index].kind == GL_ATTACHMENT_KIND_RENDERBUFFER) {
+        GLRenderbuffer *rb = get_renderbuffer(g_framebuffers[fbo].color_attachments[attachment_index].object);
+        return rb ? rb->internal_format : GL_RGBA8;
+    }
+
+    return GL_RGBA8;
+}
+
+static GX2ColorBuffer *get_default_color_buffer(void) {
+    GX2ColorBuffer *preferred = g_default_framebuffer_uses_drc ? WHBGfxGetDRCColourBuffer()
+                                                               : WHBGfxGetTVColourBuffer();
+    if (preferred) {
+        return preferred;
+    }
+    return g_default_framebuffer_uses_drc ? WHBGfxGetTVColourBuffer()
+                                          : WHBGfxGetDRCColourBuffer();
+}
+
+static GX2DepthBuffer *get_default_depth_buffer(void) {
+    GX2DepthBuffer *preferred = g_default_framebuffer_uses_drc ? WHBGfxGetDRCDepthBuffer()
+                                                               : WHBGfxGetTVDepthBuffer();
+    if (preferred) {
+        return preferred;
+    }
+    return g_default_framebuffer_uses_drc ? WHBGfxGetTVDepthBuffer()
+                                          : WHBGfxGetDRCDepthBuffer();
+}
+
 void gl_framebuffer_init(void) {
     memset(g_framebuffers, 0, sizeof(g_framebuffers));
     memset(g_renderbuffers, 0, sizeof(g_renderbuffers));
     g_framebuffers[0].in_use = true;
+    g_default_framebuffer_uses_drc = false;
     init_draw_buffer_defaults(&g_framebuffers[0], true);
     init_read_buffer_default(&g_framebuffers[0], true);
 }
@@ -216,6 +799,12 @@ void gl_framebuffer_init(void) {
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+void gl_framebuffer_set_default_target_drc(GLboolean use_drc) {
+    g_default_framebuffer_uses_drc = use_drc ? true : false;
+    if (g_gl_context && g_gl_context->bound_framebuffer == 0)
+        g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
+}
 
 void _gl_GenFramebuffers(GLsizei n, GLuint *fbs) {
     if (!g_gl_context || n < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
@@ -250,7 +839,12 @@ void _gl_DeleteRenderbuffers(GLsizei n, const GLuint *rbs) {
     for (int i = 0; i < n; i++) {
         GLuint id = rbs[i];
         if (id > 0 && id < MAX_RENDERBUFFERS && g_renderbuffers[id].in_use) {
-            if (g_renderbuffers[id].surface.image) gl_mem_free(GL_MEM_TYPE_MEM2, g_renderbuffers[id].surface.image);
+            if (g_gl_context->bound_renderbuffer == id) {
+                g_gl_context->bound_renderbuffer = 0;
+            }
+            detach_renderbuffer_from_framebuffers(id);
+            free_color_buffer_aux(&g_renderbuffers[id].color_buffer);
+            free_surface_storage(&g_renderbuffers[id].surface);
             memset(&g_renderbuffers[id], 0, sizeof(GLRenderbuffer));
         }
     }
@@ -262,15 +856,27 @@ void _gl_DeleteFramebuffers(GLsizei n, const GLuint *fbs) {
     for (int i = 0; i < n; i++) {
         GLuint id = fbs[i];
         if (id > 0 && id < MAX_FRAMEBUFFERS && g_framebuffers[id].in_use) {
+            if (g_gl_context->bound_framebuffer == id) {
+                g_gl_context->bound_framebuffer = 0;
+                g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
+            }
+            if (g_gl_context->bound_read_framebuffer == id) {
+                g_gl_context->bound_read_framebuffer = 0;
+            }
+            for (uint32_t j = 0; j < 8; ++j) free_framebuffer_texture_target(&g_framebuffers[id], j);
             g_framebuffers[id].in_use = false;
         }
     }
 }
 
 void _gl_BindFramebuffer(GLenum target, GLuint fb) {
+    GLuint previous_draw_fb;
     if (!g_gl_context) return;
     if (!is_framebuffer_target(target)) { _gl_set_error(GL_INVALID_ENUM); return; }
     if (fb >= MAX_FRAMEBUFFERS || (fb > 0 && !g_framebuffers[fb].in_use)) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    previous_draw_fb = g_gl_context->bound_framebuffer;
+    if ((target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) && previous_draw_fb != fb && previous_draw_fb < MAX_FRAMEBUFFERS)
+        resolve_framebuffer_texture_targets(&g_framebuffers[previous_draw_fb]);
     if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) { g_gl_context->bound_framebuffer = fb; g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER; }
     if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) { g_gl_context->bound_read_framebuffer = fb; }
 }
@@ -284,13 +890,30 @@ void _gl_BindRenderbuffer(GLenum target, GLuint rb) {
 
 void _gl_FramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
     if (!g_gl_context) return;
-    if (!is_framebuffer_target(target) || textarget != GL_TEXTURE_2D) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (!is_framebuffer_target(target) ||
+        (textarget != GL_TEXTURE_2D && !is_cube_map_face_target(textarget))) { _gl_set_error(GL_INVALID_ENUM); return; }
     GLuint fbo = get_bound_framebuffer_for_target(target);
     if (fbo == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+        if (texture == 0) {
+            clear_attachment_ref(&g_framebuffers[fbo].depth_attachment);
+            clear_attachment_ref(&g_framebuffers[fbo].stencil_attachment);
+        } else {
+            g_framebuffers[fbo].depth_attachment.kind = GL_ATTACHMENT_KIND_TEXTURE;
+            g_framebuffers[fbo].depth_attachment.object = texture;
+            g_framebuffers[fbo].stencil_attachment.kind = GL_ATTACHMENT_KIND_TEXTURE;
+            g_framebuffers[fbo].stencil_attachment.object = texture;
+        }
+        g_framebuffers[fbo].dirty = true;
+        g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
+        return;
+    }
     GLAttachmentRef *ref = get_attachment_ref(&g_framebuffers[fbo], attachment);
     if (!ref) { _gl_set_error(GL_INVALID_ENUM); return; }
     if (texture == 0) clear_attachment_ref(ref);
     else { ref->kind = GL_ATTACHMENT_KIND_TEXTURE; ref->object = texture; }
+    if (attachment >= GL_COLOR_ATTACHMENT0 && attachment <= GL_COLOR_ATTACHMENT7)
+        free_framebuffer_texture_target(&g_framebuffers[fbo], attachment - GL_COLOR_ATTACHMENT0);
     g_framebuffers[fbo].dirty = true;
     g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
 }
@@ -300,10 +923,26 @@ void _gl_FramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum rbtarg
     if (!is_framebuffer_target(target) || rbtarget != GL_RENDERBUFFER) { _gl_set_error(GL_INVALID_ENUM); return; }
     GLuint fbo = get_bound_framebuffer_for_target(target);
     if (fbo == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+        if (rb == 0) {
+            clear_attachment_ref(&g_framebuffers[fbo].depth_attachment);
+            clear_attachment_ref(&g_framebuffers[fbo].stencil_attachment);
+        } else {
+            g_framebuffers[fbo].depth_attachment.kind = GL_ATTACHMENT_KIND_RENDERBUFFER;
+            g_framebuffers[fbo].depth_attachment.object = rb;
+            g_framebuffers[fbo].stencil_attachment.kind = GL_ATTACHMENT_KIND_RENDERBUFFER;
+            g_framebuffers[fbo].stencil_attachment.object = rb;
+        }
+        g_framebuffers[fbo].dirty = true;
+        g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
+        return;
+    }
     GLAttachmentRef *ref = get_attachment_ref(&g_framebuffers[fbo], attachment);
     if (!ref) { _gl_set_error(GL_INVALID_ENUM); return; }
     if (rb == 0) clear_attachment_ref(ref);
     else { ref->kind = GL_ATTACHMENT_KIND_RENDERBUFFER; ref->object = rb; }
+    if (attachment >= GL_COLOR_ATTACHMENT0 && attachment <= GL_COLOR_ATTACHMENT7)
+        free_framebuffer_texture_target(&g_framebuffers[fbo], attachment - GL_COLOR_ATTACHMENT0);
     g_framebuffers[fbo].dirty = true;
     g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
 }
@@ -314,88 +953,545 @@ void _gl_RenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width
     if (id == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
     GLRenderbuffer *rb = &g_renderbuffers[id];
     GX2SurfaceFormat fmt; GX2SurfaceUse use; bool is_depth;
+    GX2RResourceFlags surface_flags;
     if (!get_renderbuffer_format_info(internalformat, &fmt, &use, &is_depth)) { _gl_set_error(GL_INVALID_ENUM); return; }
-    if (rb->surface.image) gl_mem_free(GL_MEM_TYPE_MEM2, rb->surface.image);
+    free_color_buffer_aux(&rb->color_buffer);
+    free_surface_storage(&rb->surface);
     rb->surface.dim = GX2_SURFACE_DIM_TEXTURE_2D; rb->surface.width = width; rb->surface.height = height;
     rb->surface.depth = 1; rb->surface.mipLevels = 1; rb->surface.format = fmt; rb->surface.aa = GX2_AA_MODE1X; rb->surface.use = use;
     rb->surface.tileMode = is_depth ? GX2_TILE_MODE_DEFAULT : GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&rb->surface);
-    rb->surface.image = gl_mem_alloc(GL_MEM_TYPE_MEM2, rb->surface.imageSize, rb->surface.alignment);
+    surface_flags = build_framebuffer_surface_flags(internalformat, is_depth, false);
+    if (!GX2RCreateSurface(&rb->surface, surface_flags)) {
+        memset(&rb->surface, 0, sizeof(rb->surface));
+        _gl_set_error(GL_OUT_OF_MEMORY);
+        return;
+    }
+    if (rb->surface.image && rb->surface.imageSize)
+        memset(rb->surface.image, 0, rb->surface.imageSize);
+    if (rb->surface.mipmaps && rb->surface.mipmapSize)
+        memset(rb->surface.mipmaps, 0, rb->surface.mipmapSize);
     rb->width = width; rb->height = height; rb->internal_format = internalformat; rb->is_depth = is_depth;
     if (is_depth) init_depth_buffer_from_surface(&rb->depth_buffer, &rb->surface);
-    else init_color_buffer_from_surface(&rb->color_buffer, &rb->surface);
+    else if (!init_color_buffer_from_surface(&rb->color_buffer, &rb->surface)) {
+        free_surface_storage(&rb->surface);
+        _gl_set_error(GL_OUT_OF_MEMORY);
+        return;
+    }
     g_gl_context->dirty_flags |= GL_DIRTY_FRAMEBUFFER;
 }
 
 void _gl_ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid *pixels) {
-    if (!pixels || width <= 0 || height <= 0) { _gl_set_error(GL_INVALID_VALUE); return; }
-    if (format != GL_RGBA && format != 0x80E1 /*GL_BGRA*/) { _gl_set_error(GL_INVALID_ENUM); return; }
-    if (type != GL_UNSIGNED_BYTE) { _gl_set_error(GL_INVALID_ENUM); return; }
-    if (!gl_read_color_pixels_rgba8(x, y, width, height, pixels)) _gl_set_error(GL_INVALID_OPERATION);
+    size_t tight_row_bytes;
+    size_t tight_size;
+    uint8_t *tight_pixels;
+    uint8_t *dst_base;
+    GLint pack_row_length;
+    GLint pack_skip_rows;
+    GLint pack_skip_pixels;
+    GLint pack_alignment;
+    size_t dst_row_pixels;
+    size_t dst_row_bytes;
+    size_t dst_stride;
+
+    if (!g_gl_context) return;
+    if (width < 0 || height < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (!pixels) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (_gl_CheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        _gl_set_error(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return;
+    }
+    if (width == 0 || height == 0) return;
+    if (!get_read_color_buffer()) { _gl_set_error(GL_INVALID_OPERATION); return; }
+
+    tight_row_bytes = (size_t)width * 4u;
+    tight_size = tight_row_bytes * (size_t)height;
+    tight_pixels = (uint8_t *)gl_mem_alloc(GL_MEM_TYPE_MEM2, tight_size, 64);
+    if (!tight_pixels) {
+        _gl_set_error(GL_OUT_OF_MEMORY);
+        return;
+    }
+
+    if (!gl_read_color_pixels_rgba8(x, y, width, height, tight_pixels)) {
+        gl_mem_free(GL_MEM_TYPE_MEM2, tight_pixels);
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+
+    pack_row_length = g_gl_context->pack_row_length > 0 ? g_gl_context->pack_row_length : width;
+    pack_skip_rows = g_gl_context->pack_skip_rows > 0 ? g_gl_context->pack_skip_rows : 0;
+    pack_skip_pixels = g_gl_context->pack_skip_pixels > 0 ? g_gl_context->pack_skip_pixels : 0;
+    pack_alignment = g_gl_context->pack_alignment > 0 ? g_gl_context->pack_alignment : 1;
+    if (pack_row_length < width) {
+        gl_mem_free(GL_MEM_TYPE_MEM2, tight_pixels);
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    dst_row_pixels = (size_t)pack_row_length;
+    dst_row_bytes = dst_row_pixels * 4u;
+    dst_stride = ((dst_row_bytes + (size_t)pack_alignment - 1u) / (size_t)pack_alignment) * (size_t)pack_alignment;
+    dst_base = (uint8_t *)pixels + (size_t)pack_skip_rows * dst_stride + (size_t)pack_skip_pixels * 4u;
+
+    for (GLsizei row = 0; row < height; ++row) {
+        memcpy(dst_base + (size_t)row * dst_stride,
+               tight_pixels + (size_t)row * tight_row_bytes,
+               tight_row_bytes);
+    }
+
+    gl_mem_free(GL_MEM_TYPE_MEM2, tight_pixels);
 }
 
 void _gl_FramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
     _gl_FramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
 }
 
+static GX2ColorBuffer *get_draw_blit_color_buffer(void) {
+    GLuint fbo;
+
+    if (!g_gl_context) return NULL;
+    fbo = g_gl_context->bound_framebuffer;
+    if (fbo == 0) {
+        return g_framebuffers[0].draw_buffers[0] == GL_BACK ? get_default_color_buffer() : NULL;
+    }
+
+    gl_bind_framebuffers();
+
+    if (fbo >= MAX_FRAMEBUFFERS || !g_framebuffers[fbo].in_use) return NULL;
+    for (uint32_t i = 0; i < 8; ++i) {
+        uint32_t attachment_index = 0;
+        if (get_color_attachment_index(g_framebuffers[fbo].draw_buffers[i], &attachment_index) &&
+            attachment_ref_present(&g_framebuffers[fbo].color_attachments[attachment_index])) {
+            return &g_framebuffers[fbo].cb[attachment_index];
+        }
+    }
+    return NULL;
+}
+
+static uint16_t encode_half_float_bits(float value) {
+    uint32_t word;
+    uint32_t sign;
+    int32_t exponent;
+    uint32_t mantissa;
+
+    memcpy(&word, &value, sizeof(word));
+    sign = (word >> 16) & 0x8000u;
+    exponent = (int32_t)((word >> 23) & 0xFFu) - 127 + 15;
+    mantissa = word & 0x7FFFFFu;
+
+    if (((word >> 23) & 0xFFu) == 0xFFu) {
+        if (mantissa != 0) return (uint16_t)(sign | 0x7E00u);
+        return (uint16_t)(sign | 0x7C00u);
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return (uint16_t)sign;
+        mantissa |= 0x800000u;
+        mantissa = mantissa >> (uint32_t)(1 - exponent);
+        if (mantissa & 0x00001000u) mantissa += 0x00002000u;
+        return (uint16_t)(sign | (mantissa >> 13));
+    }
+    if (exponent >= 31) {
+        return (uint16_t)(sign | 0x7C00u);
+    }
+    if (mantissa & 0x00001000u) {
+        mantissa += 0x00002000u;
+        if (mantissa & 0x00800000u) {
+            mantissa = 0;
+            ++exponent;
+            if (exponent >= 31) return (uint16_t)(sign | 0x7C00u);
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)exponent << 10) | (mantissa >> 13));
+}
+
+static void encode_gpu_half_float(uint8_t *ptr, float value) {
+    uint16_t word = CPU_TO_GPU_16(encode_half_float_bits(value));
+    memcpy(ptr, &word, sizeof(word));
+}
+
+static uint8_t clamp_u8_from_float(float value) {
+    if (value <= 0.0f) return 0;
+    if (value >= 255.0f) return 255;
+    return (uint8_t)(value + 0.5f);
+}
+
+static const uint8_t *get_rgba8_source_texel(const uint8_t *pixels,
+                                             GLsizei width,
+                                             GLsizei height,
+                                             GLint x,
+                                             GLint y,
+                                             bool flip_x,
+                                             bool flip_y) {
+    GLint sample_x = flip_x ? (width - 1 - x) : x;
+    GLint sample_y = flip_y ? (height - 1 - y) : y;
+
+    if (sample_x < 0) sample_x = 0;
+    if (sample_x >= width) sample_x = width - 1;
+    if (sample_y < 0) sample_y = 0;
+    if (sample_y >= height) sample_y = height - 1;
+
+    return pixels + (((size_t)sample_y * (size_t)width) + (size_t)sample_x) * 4u;
+}
+
+static void scale_rgba8_pixels(const uint8_t *src_pixels,
+                               GLsizei src_width,
+                               GLsizei src_height,
+                               GLsizei dst_width,
+                               GLsizei dst_height,
+                               GLenum filter,
+                               bool src_flip_x,
+                               bool src_flip_y,
+                               uint8_t *dst_pixels) {
+    for (GLsizei dy = 0; dy < dst_height; ++dy) {
+        for (GLsizei dx = 0; dx < dst_width; ++dx) {
+            uint8_t *dst_texel = dst_pixels + (((size_t)dy * (size_t)dst_width) + (size_t)dx) * 4u;
+
+            if (filter == GL_NEAREST) {
+                GLint sx = (GLint)(((float)dx + 0.5f) * (float)src_width / (float)dst_width);
+                GLint sy = (GLint)(((float)dy + 0.5f) * (float)src_height / (float)dst_height);
+                const uint8_t *src_texel;
+
+                if (sx >= src_width) sx = src_width - 1;
+                if (sy >= src_height) sy = src_height - 1;
+                src_texel = get_rgba8_source_texel(src_pixels, src_width, src_height,
+                                                   sx, sy, src_flip_x, src_flip_y);
+                memcpy(dst_texel, src_texel, 4u);
+                continue;
+            }
+
+            {
+                float src_x = (((float)dx + 0.5f) * (float)src_width / (float)dst_width) - 0.5f;
+                float src_y = (((float)dy + 0.5f) * (float)src_height / (float)dst_height) - 0.5f;
+                GLint x0 = (GLint)floorf(src_x);
+                GLint y0 = (GLint)floorf(src_y);
+                GLint x1 = x0 + 1;
+                GLint y1 = y0 + 1;
+                float tx = src_x - (float)x0;
+                float ty = src_y - (float)y0;
+                const uint8_t *p00;
+                const uint8_t *p10;
+                const uint8_t *p01;
+                const uint8_t *p11;
+
+                p00 = get_rgba8_source_texel(src_pixels, src_width, src_height, x0, y0, src_flip_x, src_flip_y);
+                p10 = get_rgba8_source_texel(src_pixels, src_width, src_height, x1, y0, src_flip_x, src_flip_y);
+                p01 = get_rgba8_source_texel(src_pixels, src_width, src_height, x0, y1, src_flip_x, src_flip_y);
+                p11 = get_rgba8_source_texel(src_pixels, src_width, src_height, x1, y1, src_flip_x, src_flip_y);
+
+                for (uint32_t c = 0; c < 4; ++c) {
+                    float top = (float)p00[c] + ((float)p10[c] - (float)p00[c]) * tx;
+                    float bottom = (float)p01[c] + ((float)p11[c] - (float)p01[c]) * tx;
+                    dst_texel[c] = clamp_u8_from_float(top + (bottom - top) * ty);
+                }
+            }
+        }
+    }
+}
+
+static bool write_rgba8_to_surface(GX2Surface *surface,
+                                   GLint dstX0,
+                                   GLint dstY0,
+                                   GLint dstX1,
+                                   GLint dstY1,
+                                   const uint8_t *pixels) {
+    GLsizei width;
+    GLsizei height;
+    bool flip_x;
+    bool flip_y;
+    GLint min_x;
+    GLint max_x;
+    GLint min_y;
+    GLint max_y;
+    uint8_t *surface_bytes;
+
+    if (!surface || !surface->image || !pixels) return false;
+
+    width = dstX1 >= dstX0 ? (dstX1 - dstX0) : (dstX0 - dstX1);
+    height = dstY1 >= dstY0 ? (dstY1 - dstY0) : (dstY0 - dstY1);
+    if (width <= 0 || height <= 0) return true;
+
+    flip_x = dstX1 < dstX0;
+    flip_y = dstY1 < dstY0;
+    min_x = flip_x ? dstX1 : dstX0;
+    max_x = flip_x ? dstX0 : dstX1;
+    min_y = flip_y ? dstY1 : dstY0;
+    max_y = flip_y ? dstY0 : dstY1;
+    surface_bytes = (uint8_t *)surface->image;
+
+    for (GLsizei dy = 0; dy < height; ++dy) {
+        GLint gl_y = flip_y ? (max_y - 1 - dy) : (min_y + dy);
+        uint32_t surface_y;
+        const uint8_t *src_row;
+
+        if (gl_y < 0 || gl_y >= (GLint)surface->height) continue;
+        surface_y = (uint32_t)((GLint)surface->height - 1 - gl_y);
+        src_row = pixels + (size_t)dy * (size_t)width * 4u;
+
+        for (GLsizei dx = 0; dx < width; ++dx) {
+            GLint gl_x = flip_x ? (max_x - 1 - dx) : (min_x + dx);
+            const uint8_t *src_texel;
+
+            if (gl_x < 0 || gl_x >= (GLint)surface->width) continue;
+
+            src_texel = src_row + (size_t)dx * 4u;
+            switch (surface->format) {
+            case GX2_SURFACE_FORMAT_UNORM_R8: {
+                uint8_t *dst_texel = surface_bytes + (size_t)surface_y * (size_t)surface->pitch + (size_t)gl_x;
+                dst_texel[0] = src_texel[0];
+                break;
+            }
+            case GX2_SURFACE_FORMAT_UNORM_R8_G8: {
+                uint8_t *dst_texel =
+                    surface_bytes + (((size_t)surface_y * (size_t)surface->pitch) + (size_t)gl_x) * 2u;
+                dst_texel[0] = src_texel[0];
+                dst_texel[1] = src_texel[1];
+                break;
+            }
+            case GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8: {
+                uint8_t *dst_texel =
+                    surface_bytes + (((size_t)surface_y * (size_t)surface->pitch) + (size_t)gl_x) * 4u;
+                dst_texel[0] = src_texel[0];
+                dst_texel[1] = src_texel[1];
+                dst_texel[2] = src_texel[2];
+                dst_texel[3] = src_texel[3];
+                break;
+            }
+            case GX2_SURFACE_FORMAT_FLOAT_R16_G16_B16_A16: {
+                uint8_t *dst_texel =
+                    surface_bytes + (((size_t)surface_y * (size_t)surface->pitch) + (size_t)gl_x) * 8u;
+                encode_gpu_half_float(dst_texel + 0u, (float)src_texel[0] / 255.0f);
+                encode_gpu_half_float(dst_texel + 2u, (float)src_texel[1] / 255.0f);
+                encode_gpu_half_float(dst_texel + 4u, (float)src_texel[2] / 255.0f);
+                encode_gpu_half_float(dst_texel + 6u, (float)src_texel[3] / 255.0f);
+                break;
+            }
+            case GX2_SURFACE_FORMAT_FLOAT_R32_G32_B32_A32: {
+                uint8_t *dst_texel =
+                    surface_bytes + (((size_t)surface_y * (size_t)surface->pitch) + (size_t)gl_x) * 16u;
+                float r = (float)src_texel[0] / 255.0f;
+                float g = (float)src_texel[1] / 255.0f;
+                float b = (float)src_texel[2] / 255.0f;
+                float a = (float)src_texel[3] / 255.0f;
+                encode_gpu_float32(dst_texel + 0u, r);
+                encode_gpu_float32(dst_texel + 4u, g);
+                encode_gpu_float32(dst_texel + 8u, b);
+                encode_gpu_float32(dst_texel + 12u, a);
+                break;
+            }
+            default:
+                return false;
+            }
+        }
+    }
+
+    DCFlushRange(surface->image, surface->imageSize);
+    invalidate_surface_after_color_write(surface);
+    return true;
+}
+
 void _gl_BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
-    (void)srcX0; (void)srcY0; (void)dstX0; (void)dstY0; (void)filter;
+    GX2ColorBuffer *src_cb;
+    GX2ColorBuffer *dst_cb;
+    GX2Surface *src_surface;
+    GX2Surface *dst_surface;
+    GLsizei src_width;
+    GLsizei src_height;
+    GLsizei dst_width;
+    GLsizei dst_height;
+    GLint src_min_x;
+    GLint src_min_y;
+    bool src_flip_x;
+    bool src_flip_y;
+    bool whole_surface_copy;
+    uint8_t *src_pixels;
+    uint8_t *dst_pixels;
+    size_t src_size;
+    size_t dst_size;
+
     if (!g_gl_context) return;
-    uint32_t srcW = (uint32_t)(srcX1 - srcX0); uint32_t srcH = (uint32_t)(srcY1 - srcY0);
-    uint32_t dstW = (uint32_t)(dstX1 - dstX0); uint32_t dstH = (uint32_t)(dstY1 - dstY0);
-    (void)srcW; (void)srcH; (void)dstW; (void)dstH;
-    if (mask & GL_COLOR_BUFFER_BIT) {
-        GX2ColorBuffer *src_cb = NULL, *dst_cb = NULL;
-        GLuint read_fbo = g_gl_context->bound_read_framebuffer;
-        GLuint draw_fbo = g_gl_context->bound_framebuffer;
-        if (read_fbo == 0) src_cb = WHBGfxGetTVColourBuffer();
-        else if (read_fbo < MAX_FRAMEBUFFERS && g_framebuffers[read_fbo].in_use)
-            src_cb = &g_framebuffers[read_fbo].cb[0];
-        if (draw_fbo == 0) dst_cb = WHBGfxGetTVColourBuffer();
-        else if (draw_fbo < MAX_FRAMEBUFFERS && g_framebuffers[draw_fbo].in_use)
-            dst_cb = &g_framebuffers[draw_fbo].cb[0];
-        if (src_cb && dst_cb)
-            GX2CopySurface(&src_cb->surface, 0, 0, &dst_cb->surface, 0, 0);
+    if (mask == 0) return;
+    if (filter != GL_NEAREST && filter != GL_LINEAR) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
     }
-    if (mask & GL_DEPTH_BUFFER_BIT) {
-        GX2DepthBuffer *src_db = NULL, *dst_db = NULL;
-        GLuint read_fbo = g_gl_context->bound_read_framebuffer;
-        GLuint draw_fbo = g_gl_context->bound_framebuffer;
-        if (read_fbo == 0) src_db = WHBGfxGetTVDepthBuffer();
-        else if (read_fbo < MAX_FRAMEBUFFERS && g_framebuffers[read_fbo].in_use)
-            src_db = &g_framebuffers[read_fbo].db;
-        if (draw_fbo == 0) dst_db = WHBGfxGetTVDepthBuffer();
-        else if (draw_fbo < MAX_FRAMEBUFFERS && g_framebuffers[draw_fbo].in_use)
-            dst_db = &g_framebuffers[draw_fbo].db;
-        if (src_db && dst_db)
-            GX2CopySurface(&src_db->surface, 0, 0, &dst_db->surface, 0, 0);
+    /* TODO: support nearest depth/stencil blits; for now the depth/stencil path remains intentionally unimplemented. */
+    if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) {
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
     }
+    if ((mask & ~GL_COLOR_BUFFER_BIT) != 0) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+
+    if (_gl_CheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
+        _gl_CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        _gl_set_error(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return;
+    }
+
+    src_width = srcX1 >= srcX0 ? (srcX1 - srcX0) : (srcX0 - srcX1);
+    src_height = srcY1 >= srcY0 ? (srcY1 - srcY0) : (srcY0 - srcY1);
+    dst_width = dstX1 >= dstX0 ? (dstX1 - dstX0) : (dstX0 - dstX1);
+    dst_height = dstY1 >= dstY0 ? (dstY1 - dstY0) : (dstY0 - dstY1);
+    if (src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0) return;
+
+    src_cb = get_read_color_buffer();
+    dst_cb = get_draw_blit_color_buffer();
+    if (!src_cb || !dst_cb || !src_cb->surface.image || !dst_cb->surface.image) {
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+
+    src_surface = &src_cb->surface;
+    dst_surface = &dst_cb->surface;
+    whole_surface_copy =
+        src_width == dst_width &&
+        src_height == dst_height &&
+        srcX0 <= srcX1 && srcY0 <= srcY1 &&
+        dstX0 <= dstX1 && dstY0 <= dstY1 &&
+        srcX0 == 0 && srcY0 == 0 &&
+        dstX0 == 0 && dstY0 == 0 &&
+        src_width == (GLsizei)src_surface->width &&
+        src_height == (GLsizei)src_surface->height &&
+        dst_width == (GLsizei)dst_surface->width &&
+        dst_height == (GLsizei)dst_surface->height &&
+        src_surface->format == dst_surface->format;
+
+    if (whole_surface_copy) {
+        GX2DrawDone();
+        GX2CopySurface(src_surface, 0, 0, dst_surface, 0, 0);
+        GX2DrawDone();
+        invalidate_surface_after_color_write(dst_surface);
+        return;
+    }
+
+    src_size = (size_t)src_width * (size_t)src_height * 4u;
+    dst_size = (size_t)dst_width * (size_t)dst_height * 4u;
+    src_pixels = (uint8_t *)gl_mem_alloc(GL_MEM_TYPE_MEM2, src_size, 64);
+    dst_pixels = (uint8_t *)gl_mem_alloc(GL_MEM_TYPE_MEM2, dst_size, 64);
+    if (!src_pixels || !dst_pixels) {
+        if (src_pixels) gl_mem_free(GL_MEM_TYPE_MEM2, src_pixels);
+        if (dst_pixels) gl_mem_free(GL_MEM_TYPE_MEM2, dst_pixels);
+        _gl_set_error(GL_OUT_OF_MEMORY);
+        return;
+    }
+
+    src_min_x = srcX0 < srcX1 ? srcX0 : srcX1;
+    src_min_y = srcY0 < srcY1 ? srcY0 : srcY1;
+    src_flip_x = srcX1 < srcX0;
+    src_flip_y = srcY1 < srcY0;
+
+    if (!gl_read_color_pixels_rgba8(src_min_x, src_min_y, src_width, src_height, src_pixels)) {
+        gl_mem_free(GL_MEM_TYPE_MEM2, src_pixels);
+        gl_mem_free(GL_MEM_TYPE_MEM2, dst_pixels);
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+
+    scale_rgba8_pixels(src_pixels, src_width, src_height,
+                       dst_width, dst_height, filter,
+                       src_flip_x, src_flip_y, dst_pixels);
+    gl_mem_free(GL_MEM_TYPE_MEM2, src_pixels);
+
+    if (!write_rgba8_to_surface(dst_surface, dstX0, dstY0, dstX1, dstY1, dst_pixels)) {
+        gl_mem_free(GL_MEM_TYPE_MEM2, dst_pixels);
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+
+    gl_mem_free(GL_MEM_TYPE_MEM2, dst_pixels);
 }
 
 void _gl_RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {
     (void)samples; _gl_RenderbufferStorage(target, internalformat, width, height);
 }
 
-void _gl_GenQueries(GLsizei n, GLuint *ids) { if (n < 0) { _gl_set_error(GL_INVALID_VALUE); return; } for (int i = 0; i < n; i++) ids[i] = 0; }
-void _gl_DeleteQueries(GLsizei n, const GLuint *ids) { (void)n; (void)ids; }
+void _gl_GenQueries(GLsizei n, GLuint *ids) {
+    if (n < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (n > 0 && !ids) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (ids) for (int i = 0; i < n; i++) ids[i] = 0;
+    if (n > 0) _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_DeleteQueries(GLsizei n, const GLuint *ids) {
+    if (n < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (n > 0 && !ids) { _gl_set_error(GL_INVALID_VALUE); return; }
+}
 GLboolean _gl_IsQuery(GLuint id) { (void)id; return GL_FALSE; }
-void _gl_BeginQuery(GLenum target, GLuint id) { (void)target; (void)id; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_EndQuery(GLenum target) { (void)target; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_GetQueryiv(GLenum target, GLenum pname, GLint *params) { (void)target; (void)pname; (void)params; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_GetQueryObjectiv(GLuint id, GLenum pname, GLint *params) { (void)id; (void)pname; (void)params; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_GetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params) { (void)id; (void)pname; (void)params; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_BeginConditionalRender(GLuint id, GLenum mode) { (void)id; (void)mode; _gl_set_error(GL_INVALID_OPERATION); }
+void _gl_BeginQuery(GLenum target, GLuint id) {
+    if (!is_query_target(target)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (id == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_EndQuery(GLenum target) {
+    if (!is_query_target(target)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_GetQueryiv(GLenum target, GLenum pname, GLint *params) {
+    if (!params) return;
+    if (!is_query_target(target) || !is_query_pname(pname)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    *params = 0;
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_GetQueryObjectiv(GLuint id, GLenum pname, GLint *params) {
+    if (!params) return;
+    if (!is_query_object_pname(pname)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    *params = 0;
+    if (id == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_GetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params) {
+    if (!params) return;
+    if (!is_query_object_pname(pname)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    *params = 0;
+    if (id == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_BeginConditionalRender(GLuint id, GLenum mode) {
+    if (!is_conditional_render_mode(mode)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (id == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
 void _gl_EndConditionalRender(void) { _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_BeginQueryIndexed(GLenum target, GLuint index, GLuint id) { (void)target; (void)index; (void)id; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_EndQueryIndexed(GLenum target, GLuint index) { (void)target; (void)index; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_GetQueryIndexediv(GLenum target, GLuint index, GLenum pname, GLint *params) { (void)target; (void)index; (void)pname; (void)params; _gl_set_error(GL_INVALID_OPERATION); }
-void _gl_GenTransformFeedbacks(GLsizei n, GLuint *ids) { if (n < 0) { _gl_set_error(GL_INVALID_VALUE); return; } for (int i = 0; i < n; i++) ids[i] = 0; }
-void _gl_DeleteTransformFeedbacks(GLsizei n, const GLuint *ids) { (void)n; (void)ids; }
+void _gl_BeginQueryIndexed(GLenum target, GLuint index, GLuint id) {
+    if (!is_query_target(target)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (index != 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (id == 0) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_EndQueryIndexed(GLenum target, GLuint index) {
+    if (!is_query_target(target)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    if (index != 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_GetQueryIndexediv(GLenum target, GLuint index, GLenum pname, GLint *params) {
+    if (!params) return;
+    if (!is_query_target(target) || !is_query_pname(pname)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    *params = 0;
+    if (index != 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_GenTransformFeedbacks(GLsizei n, GLuint *ids) {
+    if (n < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (n > 0 && !ids) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (ids) for (int i = 0; i < n; i++) ids[i] = 0;
+    if (n > 0) _gl_set_error(GL_INVALID_OPERATION);
+}
+void _gl_DeleteTransformFeedbacks(GLsizei n, const GLuint *ids) {
+    if (n < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (n > 0 && !ids) { _gl_set_error(GL_INVALID_VALUE); return; }
+}
 
 void _gl_DrawBuffer(GLenum buf) {
     if (!g_gl_context) return;
     GLuint fbo = g_gl_context->bound_framebuffer;
     GLFramebuffer *fb = &g_framebuffers[fbo];
+    if (fbo == 0) {
+        if (buf != GL_NONE && buf != GL_BACK) { _gl_set_error(GL_INVALID_ENUM); return; }
+    } else if (buf != GL_NONE && !get_color_attachment_index(buf, NULL)) {
+        _gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
     fb->draw_buffers[0] = buf;
     for (uint32_t i = 1; i < 8; ++i) fb->draw_buffers[i] = GL_NONE;
     fb->dirty = true;
@@ -403,8 +1499,22 @@ void _gl_DrawBuffer(GLenum buf) {
 }
 void _gl_DrawBuffers(GLsizei n, const GLenum *bufs) {
     if (!g_gl_context || n < 0) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (n > 0 && !bufs) { _gl_set_error(GL_INVALID_VALUE); return; }
+    if (n > 8) { _gl_set_error(GL_INVALID_VALUE); return; }
     GLuint fbo = g_gl_context->bound_framebuffer;
     GLFramebuffer *fb = &g_framebuffers[fbo];
+    if (fbo == 0 && n != 1) {
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    for (GLsizei i = 0; i < n; ++i) {
+        if (fbo == 0) {
+            if (bufs[i] != GL_NONE && bufs[i] != GL_BACK) { _gl_set_error(GL_INVALID_ENUM); return; }
+        } else if (bufs[i] != GL_NONE && !get_color_attachment_index(bufs[i], NULL)) {
+            _gl_set_error(bufs[i] == GL_BACK ? GL_INVALID_OPERATION : GL_INVALID_ENUM);
+            return;
+        }
+    }
     for (uint32_t i = 0; i < 8; ++i)
         fb->draw_buffers[i] = (i < (uint32_t)n) ? bufs[i] : GL_NONE;
     fb->dirty = true;
@@ -413,6 +1523,12 @@ void _gl_DrawBuffers(GLsizei n, const GLenum *bufs) {
 void _gl_ReadBuffer(GLenum src) {
     if (!g_gl_context) return;
     GLuint fbo = g_gl_context->bound_read_framebuffer;
+    if (fbo == 0) {
+        if (src != GL_NONE && src != GL_BACK) { _gl_set_error(GL_INVALID_ENUM); return; }
+    } else if (src != GL_NONE && !get_color_attachment_index(src, NULL)) {
+        _gl_set_error(src == GL_BACK ? GL_INVALID_OPERATION : GL_INVALID_ENUM);
+        return;
+    }
     g_framebuffers[fbo].read_buffer = src;
 }
 
@@ -422,32 +1538,81 @@ GLenum _gl_CheckFramebufferStatus(GLenum target) {
     if (fbo == 0) return GL_FRAMEBUFFER_COMPLETE;
     GLFramebuffer *fb = &g_framebuffers[fbo];
     bool has_att = false;
+    GLsizei expected_width = 0;
+    GLsizei expected_height = 0;
+    bool expected_size_set = false;
     for (uint32_t i = 0; i < 8; ++i) {
+        GLsizei width;
+        GLsizei height;
+        bool is_depth;
         if (!attachment_ref_present(&fb->color_attachments[i])) continue;
         has_att = true;
-        if (fb->color_attachments[i].kind == GL_ATTACHMENT_KIND_TEXTURE) {
-            GX2Texture *t = gl_get_gx2_texture(fb->color_attachments[i].object);
-            if (!t || !t->surface.image) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
-        } else {
-            GLRenderbuffer *rb = get_renderbuffer(fb->color_attachments[i].object);
-            if (!rb || !rb->surface.image) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        if (!get_attachment_surface_info(&fb->color_attachments[i], &width, &height, &is_depth) || is_depth) {
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        }
+        if (!expected_size_set) {
+            expected_width = width;
+            expected_height = height;
+            expected_size_set = true;
+        } else if (width != expected_width || height != expected_height) {
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         }
     }
     if (attachment_ref_present(&fb->depth_attachment)) {
+        GLsizei width;
+        GLsizei height;
+        bool is_depth;
         has_att = true;
-        if (fb->depth_attachment.kind == GL_ATTACHMENT_KIND_TEXTURE) {
-            GX2Texture *t = gl_get_gx2_texture(fb->depth_attachment.object);
-            if (!t || !t->surface.image) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
-        } else {
-            GLRenderbuffer *rb = get_renderbuffer(fb->depth_attachment.object);
-            if (!rb || !rb->surface.image) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        if (!get_attachment_surface_info(&fb->depth_attachment, &width, &height, &is_depth) || !is_depth) {
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        }
+        if (!expected_size_set) {
+            expected_width = width;
+            expected_height = height;
+            expected_size_set = true;
+        } else if (width != expected_width || height != expected_height) {
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        }
+    }
+    if (attachment_ref_present(&fb->stencil_attachment)) {
+        GLsizei width;
+        GLsizei height;
+        bool is_depth;
+        has_att = true;
+        if (!get_attachment_surface_info(&fb->stencil_attachment, &width, &height, &is_depth) || !is_depth) {
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        }
+        if (!expected_size_set) {
+            expected_width = width;
+            expected_height = height;
+            expected_size_set = true;
+        } else if (width != expected_width || height != expected_height) {
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         }
     }
     if (!has_att) return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+    for (uint32_t i = 0; i < 8; ++i) {
+        uint32_t attachment_index = 0;
+        if (fb->draw_buffers[i] == GL_NONE) continue;
+        if (!get_color_attachment_index(fb->draw_buffers[i], &attachment_index) ||
+            !attachment_ref_present(&fb->color_attachments[attachment_index])) {
+            return GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER;
+        }
+    }
+    if (fb->read_buffer != GL_NONE) {
+        uint32_t attachment_index = 0;
+        if (!get_color_attachment_index(fb->read_buffer, &attachment_index)) {
+            return GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER;
+        }
+        if (!attachment_ref_present(&fb->color_attachments[attachment_index])) {
+            return GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER;
+        }
+    }
     return GL_FRAMEBUFFER_COMPLETE;
 }
 
 void _gl_GetRenderbufferParameteriv(GLenum target, GLenum pname, GLint *params) {
+    if (!params) return;
     if (!g_gl_context || target != GL_RENDERBUFFER) { _gl_set_error(GL_INVALID_ENUM); return; }
     GLuint id = g_gl_context->bound_renderbuffer;
     GLRenderbuffer *rb = get_renderbuffer(id);
@@ -461,6 +1626,7 @@ void _gl_GetRenderbufferParameteriv(GLenum target, GLenum pname, GLint *params) 
 }
 
 void _gl_GetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint *params) {
+    if (!params) return;
     if (!is_framebuffer_target(target)) { _gl_set_error(GL_INVALID_ENUM); return; }
     GLuint fbo = get_bound_framebuffer_for_target(target);
     if (fbo == 0) { *params = GL_NONE; return; }
@@ -483,25 +1649,31 @@ void gl_bind_framebuffers(void) {
     if (!g_gl_context) return;
     GLuint fbo = g_gl_context->bound_framebuffer;
     if (fbo == 0) {
-        GX2ColorBuffer *tv_color = WHBGfxGetTVColourBuffer();
-        GX2DepthBuffer *tv_depth = WHBGfxGetTVDepthBuffer();
-        if (tv_color) GX2SetColorBuffer(tv_color, GX2_RENDER_TARGET_0);
-        if (tv_depth) GX2SetDepthBuffer(tv_depth);
+        GX2ColorBuffer *default_color = get_default_color_buffer();
+        GX2DepthBuffer *default_depth = get_default_depth_buffer();
+        if (default_color) GX2SetColorBuffer(default_color, GX2_RENDER_TARGET_0);
+        if (default_depth) GX2SetDepthBuffer(default_depth);
         apply_framebuffer_output_state(&g_framebuffers[0], true);
         return;
     }
     GLFramebuffer *fb = &g_framebuffers[fbo];
     if (fb->dirty) {
         for (uint32_t i = 0; i < 8; ++i) {
-            if (!attachment_ref_present(&fb->color_attachments[i])) continue;
+            if (!attachment_ref_present(&fb->color_attachments[i])) {
+                free_framebuffer_texture_target(fb, i);
+                continue;
+            }
             if (fb->color_attachments[i].kind == GL_ATTACHMENT_KIND_TEXTURE) {
                 GX2Texture *t = gl_get_gx2_texture(fb->color_attachments[i].object);
+                free_framebuffer_texture_target(fb, i);
                 if (t) init_color_buffer_from_surface(&fb->cb[i], &t->surface);
             } else {
+                free_framebuffer_texture_target(fb, i);
                 GLRenderbuffer *rb = get_renderbuffer(fb->color_attachments[i].object);
                 if (rb && !rb->is_depth) fb->cb[i] = rb->color_buffer;
             }
         }
+        memset(&fb->db, 0, sizeof(fb->db));
         if (attachment_ref_present(&fb->depth_attachment)) {
             if (fb->depth_attachment.kind == GL_ATTACHMENT_KIND_TEXTURE) {
                 GX2Texture *t = gl_get_gx2_texture(fb->depth_attachment.object);
@@ -510,35 +1682,118 @@ void gl_bind_framebuffers(void) {
                 GLRenderbuffer *rb = get_renderbuffer(fb->depth_attachment.object);
                 if (rb && rb->is_depth) fb->db = rb->depth_buffer;
             }
+        } else if (attachment_ref_present(&fb->stencil_attachment)) {
+            if (fb->stencil_attachment.kind == GL_ATTACHMENT_KIND_TEXTURE) {
+                GX2Texture *t = gl_get_gx2_texture(fb->stencil_attachment.object);
+                if (t) init_depth_buffer_from_surface(&fb->db, &t->surface);
+            } else {
+                GLRenderbuffer *rb = get_renderbuffer(fb->stencil_attachment.object);
+                if (rb && rb->is_depth) fb->db = rb->depth_buffer;
+            }
         }
         fb->dirty = false;
     }
     for (uint32_t i = 0; i < 8; ++i) {
-        if (attachment_ref_present(&fb->color_attachments[i]) &&
-            fb->draw_buffers[i] == (GL_COLOR_ATTACHMENT0 + i))
-            GX2SetColorBuffer(&fb->cb[i], (GX2RenderTarget)i);
+        uint32_t attachment_index = 0;
+        if (get_color_attachment_index(fb->draw_buffers[i], &attachment_index) &&
+            attachment_ref_present(&fb->color_attachments[attachment_index]))
+            GX2SetColorBuffer(&fb->cb[attachment_index], (GX2RenderTarget)i);
     }
-    if (attachment_ref_present(&fb->depth_attachment))
-        GX2SetDepthBuffer(&fb->db);
+    GX2SetDepthBuffer(&fb->db);
     apply_framebuffer_output_state(fb, false);
 }
 
-GLboolean gl_is_draw_color_buffer_enabled(GLuint index) { (void)index; return GL_TRUE; }
+GLboolean gl_is_draw_color_buffer_enabled(GLuint index) {
+    if (!g_gl_context || index >= 8) return GL_FALSE;
+    if (g_gl_context->bound_framebuffer == 0) {
+        return (index == 0 && g_framebuffers[0].draw_buffers[0] == GL_BACK) ? GL_TRUE : GL_FALSE;
+    }
+
+    {
+        GLFramebuffer *fb = &g_framebuffers[g_gl_context->bound_framebuffer];
+        uint32_t attachment_index = 0;
+        return (get_color_attachment_index(fb->draw_buffers[index], &attachment_index) &&
+                attachment_ref_present(&fb->color_attachments[attachment_index])) ? GL_TRUE : GL_FALSE;
+    }
+}
 GX2ColorBuffer *gl_get_draw_color_buffer(GLuint index) {
     if (!g_gl_context) return NULL;
     GLuint fbo = g_gl_context->bound_framebuffer;
-    if (fbo == 0) return (index == 0) ? WHBGfxGetTVColourBuffer() : NULL;
-    GLFramebuffer *fb = &g_framebuffers[fbo];
-    if (index < 8 && attachment_ref_present(&fb->color_attachments[index])) return &fb->cb[index];
+    if (fbo == 0) return (index == 0 && g_framebuffers[0].draw_buffers[0] == GL_BACK) ? get_default_color_buffer() : NULL;
+    if (index >= 8) return NULL;
+    {
+        GLFramebuffer *fb = &g_framebuffers[fbo];
+        uint32_t attachment_index = 0;
+        if (get_color_attachment_index(fb->draw_buffers[index], &attachment_index) &&
+            attachment_ref_present(&fb->color_attachments[attachment_index])) return &fb->cb[attachment_index];
+    }
     return NULL;
 }
 GX2DepthBuffer *gl_get_draw_depth_buffer(void) {
     if (!g_gl_context) return NULL;
     GLuint fbo = g_gl_context->bound_framebuffer;
-    if (fbo == 0) return WHBGfxGetTVDepthBuffer();
+    if (fbo == 0) return get_default_depth_buffer();
     GLFramebuffer *fb = &g_framebuffers[fbo];
     if (attachment_ref_present(&fb->depth_attachment)) return &fb->db;
     return NULL;
+}
+
+void gl_framebuffer_mark_bound_color_dirty(void) {
+    GLuint fbo;
+    GLFramebuffer *fb;
+
+    if (!g_gl_context) return;
+    fbo = g_gl_context->bound_framebuffer;
+    if (fbo == 0 || fbo >= MAX_FRAMEBUFFERS) return;
+
+    fb = &g_framebuffers[fbo];
+    for (uint32_t i = 0; i < 8; ++i) {
+        uint32_t attachment_index = 0;
+        if (get_color_attachment_index(fb->draw_buffers[i], &attachment_index) &&
+            fb->color_attachments[attachment_index].kind == GL_ATTACHMENT_KIND_TEXTURE) {
+            fb->color_needs_resolve[attachment_index] = true;
+        }
+    }
+}
+
+void gl_framebuffer_mark_bound_color_buffer_dirty(GLuint index) {
+    GLuint fbo;
+    GLFramebuffer *fb;
+    uint32_t attachment_index = 0;
+
+    if (!g_gl_context || index >= 8) return;
+    fbo = g_gl_context->bound_framebuffer;
+    if (fbo == 0 || fbo >= MAX_FRAMEBUFFERS) return;
+
+    fb = &g_framebuffers[fbo];
+    if (get_color_attachment_index(fb->draw_buffers[index], &attachment_index) &&
+        fb->color_attachments[attachment_index].kind == GL_ATTACHMENT_KIND_TEXTURE) {
+        fb->color_needs_resolve[attachment_index] = true;
+    }
+}
+
+void gl_framebuffer_sync_bound_color_targets(void) {
+    GLuint fbo;
+    if (!g_gl_context) return;
+    fbo = g_gl_context->bound_framebuffer;
+    if (fbo == 0 || fbo >= MAX_FRAMEBUFFERS) return;
+    resolve_framebuffer_texture_targets(&g_framebuffers[fbo]);
+}
+
+void gl_framebuffer_sync_texture_for_sampling(GLuint texture) {
+    if (texture == 0) return;
+    for (uint32_t i = 0; i < MAX_FRAMEBUFFERS; ++i) {
+        GLFramebuffer *fb = &g_framebuffers[i];
+        if (!fb->in_use) continue;
+        for (uint32_t j = 0; j < 8; ++j) {
+            if (fb->color_attachments[j].kind == GL_ATTACHMENT_KIND_TEXTURE &&
+                fb->color_attachments[j].object == texture &&
+                fb->color_needs_resolve[j]) {
+                resolve_framebuffer_texture_targets(fb);
+                break;
+            }
+        }
+    }
 }
 
 void gl_framebuffer_mark_texture_dirty(GLuint texture) {
@@ -559,31 +1814,137 @@ void gl_framebuffer_mark_texture_dirty(GLuint texture) {
 }
 
 GLboolean gl_read_color_pixels_rgba8(GLint x, GLint y, GLsizei width, GLsizei height, void *pixels) {
-    if (!g_gl_context || !pixels) return GL_FALSE;
-    GX2ColorBuffer *cb = NULL;
-    GLuint fbo = g_gl_context->bound_read_framebuffer;
-    if (fbo == 0) cb = WHBGfxGetTVColourBuffer();
-    else if (fbo < MAX_FRAMEBUFFERS && g_framebuffers[fbo].in_use) cb = &g_framebuffers[fbo].cb[0];
+    GX2ColorBuffer *cb;
+    GX2Surface *surface;
+    GX2Surface staging_surface;
+    GX2Surface *read_surface;
+    uint8_t *dst;
+    GLint internal_format;
+    bool staged_surface = false;
+    GLuint read_fbo;
+    uint32_t texture_attachment_index = 0;
+
+    if (!g_gl_context || !pixels || width < 0 || height < 0) return GL_FALSE;
+    if (width == 0 || height == 0) return GL_TRUE;
+
+    cb = get_read_color_buffer();
     if (!cb || !cb->surface.image) return GL_FALSE;
-    GX2DrawDone();
-    GX2Surface *surf = &cb->surface;
-    uint32_t surf_height = surf->height;
-    uint32_t pitch = surf->pitch;
-    DCInvalidateRange(surf->image, surf->imageSize);
-    uint32_t *src = (uint32_t *)surf->image;
-    uint8_t *dst = (uint8_t *)pixels;
-    for (GLsizei row = 0; row < height; row++) {
-        GLsizei src_row = (GLsizei)surf_height - 1 - (y + row);
-        if (src_row < 0 || src_row >= (GLsizei)surf_height) continue;
-        uint32_t *src_line = src + (uint32_t)src_row * pitch + (uint32_t)x;
-        uint8_t *dst_line = dst + (GLsizei)row * width * 4;
-        for (GLsizei col = 0; col < width; col++) {
-            uint32_t px = src_line[col];
-            dst_line[col*4+0] = (px >> 24) & 0xFF;
-            dst_line[col*4+1] = (px >> 16) & 0xFF;
-            dst_line[col*4+2] = (px >>  8) & 0xFF;
-            dst_line[col*4+3] = (px >>  0) & 0xFF;
+
+    surface = &cb->surface;
+    read_fbo = g_gl_context->bound_read_framebuffer;
+    if (read_fbo > 0 && read_fbo < MAX_FRAMEBUFFERS &&
+        get_color_attachment_index(g_framebuffers[read_fbo].read_buffer, &texture_attachment_index) &&
+        g_framebuffers[read_fbo].color_attachments[texture_attachment_index].kind == GL_ATTACHMENT_KIND_TEXTURE) {
+        GX2Texture *texture =
+            gl_get_gx2_texture(g_framebuffers[read_fbo].color_attachments[texture_attachment_index].object);
+        if (texture && texture->surface.image) {
+            surface = &texture->surface;
         }
+    }
+    internal_format = get_read_color_internal_format();
+    dst = (uint8_t *)pixels;
+    memset(dst, 0, (size_t)width * (size_t)height * 4u);
+
+    GX2DrawDone();
+    memset(&staging_surface, 0, sizeof(staging_surface));
+    if (g_gl_context->bound_read_framebuffer == 0 &&
+        stage_color_surface_for_cpu_read(surface, internal_format, &staging_surface)) {
+        read_surface = &staging_surface;
+        staged_surface = true;
+    } else {
+        read_surface = surface;
+        invalidate_surface_after_color_write(read_surface);
+        DCInvalidateRange(read_surface->image, read_surface->imageSize);
+    }
+
+    for (GLsizei row = 0; row < height; ++row) {
+        GLint src_y = y + row;
+        if (src_y < 0 || src_y >= (GLint)read_surface->height) continue;
+
+        for (GLsizei col = 0; col < width; ++col) {
+            GLint src_x = x + col;
+            uint8_t *dst_texel;
+
+            if (src_x < 0 || src_x >= (GLint)read_surface->width) continue;
+
+            dst_texel = dst + ((size_t)row * (size_t)width + (size_t)col) * 4u;
+            switch (read_surface->format) {
+            case GX2_SURFACE_FORMAT_UNORM_R8: {
+                const uint8_t *src_texel =
+                    (const uint8_t *)read_surface->image + (size_t)src_y * (size_t)read_surface->pitch + (size_t)src_x;
+                if (internal_format == GL_ALPHA) {
+                    dst_texel[0] = 0;
+                    dst_texel[1] = 0;
+                    dst_texel[2] = 0;
+                    dst_texel[3] = src_texel[0];
+                } else if (internal_format == GL_LUMINANCE) {
+                    dst_texel[0] = src_texel[0];
+                    dst_texel[1] = src_texel[0];
+                    dst_texel[2] = src_texel[0];
+                    dst_texel[3] = 0xFF;
+                } else {
+                    dst_texel[0] = src_texel[0];
+                    dst_texel[1] = 0;
+                    dst_texel[2] = 0;
+                    dst_texel[3] = 0xFF;
+                }
+                break;
+            }
+            case GX2_SURFACE_FORMAT_UNORM_R8_G8: {
+                const uint8_t *src_texel =
+                    (const uint8_t *)read_surface->image +
+                    ((size_t)src_y * (size_t)read_surface->pitch + (size_t)src_x) * 2u;
+                if (internal_format == GL_LUMINANCE_ALPHA) {
+                    dst_texel[0] = src_texel[0];
+                    dst_texel[1] = src_texel[0];
+                    dst_texel[2] = src_texel[0];
+                    dst_texel[3] = src_texel[1];
+                } else {
+                    dst_texel[0] = src_texel[0];
+                    dst_texel[1] = src_texel[1];
+                    dst_texel[2] = 0;
+                    dst_texel[3] = 0xFF;
+                }
+                break;
+            }
+            case GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8: {
+                const uint32_t *src_words = (const uint32_t *)read_surface->image;
+                uint32_t pixel = src_words[(size_t)src_y * (size_t)read_surface->pitch + (size_t)src_x];
+                pixel = GPU_TO_CPU_32(pixel);
+                dst_texel[0] = (uint8_t)((pixel >> 24) & 0xFFu);
+                dst_texel[1] = (uint8_t)((pixel >> 16) & 0xFFu);
+                dst_texel[2] = (uint8_t)((pixel >> 8) & 0xFFu);
+                dst_texel[3] = (uint8_t)(pixel & 0xFFu);
+                break;
+            }
+            case GX2_SURFACE_FORMAT_FLOAT_R16_G16_B16_A16: {
+                const uint8_t *src_texel =
+                    (const uint8_t *)read_surface->image +
+                    ((size_t)src_y * (size_t)read_surface->pitch + (size_t)src_x) * 8u;
+                dst_texel[0] = float_to_unorm8(decode_gpu_half_float(src_texel + 0));
+                dst_texel[1] = float_to_unorm8(decode_gpu_half_float(src_texel + 2));
+                dst_texel[2] = float_to_unorm8(decode_gpu_half_float(src_texel + 4));
+                dst_texel[3] = float_to_unorm8(decode_gpu_half_float(src_texel + 6));
+                break;
+            }
+            case GX2_SURFACE_FORMAT_FLOAT_R32_G32_B32_A32: {
+                const uint8_t *src_texel =
+                    (const uint8_t *)read_surface->image +
+                    ((size_t)src_y * (size_t)read_surface->pitch + (size_t)src_x) * 16u;
+                dst_texel[0] = float_to_unorm8(decode_gpu_float32(src_texel + 0));
+                dst_texel[1] = float_to_unorm8(decode_gpu_float32(src_texel + 4));
+                dst_texel[2] = float_to_unorm8(decode_gpu_float32(src_texel + 8));
+                dst_texel[3] = float_to_unorm8(decode_gpu_float32(src_texel + 12));
+                break;
+            }
+            default:
+                return GL_FALSE;
+            }
+        }
+    }
+
+    if (staged_surface) {
+        free_surface_storage(&staging_surface);
     }
     return GL_TRUE;
 }

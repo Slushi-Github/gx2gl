@@ -85,6 +85,8 @@ void _gl_GetActiveUniformsiv(GLuint p, GLsizei c, const GLuint *i, GLenum n, GLi
 void _gl_GetActiveUniformName(GLuint p, GLuint i, GLsizei s, GLsizei *l, GLchar *n);
 
 void gl_bind_shaders(void);
+void gl_bind_program_fetch_shader(void);
+void gl_bind_program_textures(void);
 
 #ifdef __cplusplus
 }

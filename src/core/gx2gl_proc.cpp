@@ -1,4 +1,5 @@
 #include "gx2gl/proc.h"
+#include "gx2gl/sdl_bridge.h"
 
 #include "gl/gl.h"
 
@@ -12,6 +13,16 @@ typedef struct
 } GX2GLProcEntry;
 
 extern "C" {
+
+static void glGX2GLLoadShaderGroup(GLuint program, const void *shaderGroup)
+{
+    glWiiULoadShaderGroup(program, shaderGroup);
+}
+
+static void glGX2GLLoadShaderGroupGFD(GLuint program, GLuint index, const void *gfdData)
+{
+    glWiiULoadShaderGroupGFD(program, index, gfdData);
+}
 
 static void gx2glDeleteObjectARB(GLuint obj)
 {
@@ -63,6 +74,11 @@ static void gx2glGetAttachedObjectsARB(GLuint program, GLsizei maxCount, GLsizei
 #include "gx2gl_proc_table.inc"
 
 static const GX2GLProcEntry kGX2GLAliasProcTable[] = {
+    {"GX2GL_CopyToDRC", reinterpret_cast<GX2GL_Proc>(GX2GL_CopyToDRC)},
+    {"GX2GL_GetAutomaticDRCEnabled", reinterpret_cast<GX2GL_Proc>(GX2GL_GetAutomaticDRCEnabled)},
+    {"GX2GL_GetDefaultFramebufferTargetDRC", reinterpret_cast<GX2GL_Proc>(GX2GL_GetDefaultFramebufferTargetDRC)},
+    {"GX2GL_SetAutomaticDRCEnabled", reinterpret_cast<GX2GL_Proc>(GX2GL_SetAutomaticDRCEnabled)},
+    {"GX2GL_SetDefaultFramebufferTargetDRC", reinterpret_cast<GX2GL_Proc>(GX2GL_SetDefaultFramebufferTargetDRC)},
     {"glActiveTextureARB", reinterpret_cast<GX2GL_Proc>(glActiveTexture)},
     {"glAttachObjectARB", reinterpret_cast<GX2GL_Proc>(glAttachShader)},
     {"glBindBufferARB", reinterpret_cast<GX2GL_Proc>(glBindBuffer)},

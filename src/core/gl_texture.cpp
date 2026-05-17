@@ -1,12 +1,15 @@
 #include "gl_texture.h"
 #include "gl_context.h"
 #include "gl_framebuffer.h"
+#include "gl_shader.h"
 #include "state/gl_state.h"
 #include "endian/endian.h"
 #include "mem/gl_mem.h"
+#include "Platform/WiiU_Log.hpp"
 #include <coreinit/cache.h>
 #include <gx2/clear.h>
 #include <gx2/enum.h>
+#include <gx2/event.h>
 #include <gx2/mem.h>
 #include <gx2/sampler.h>
 #include <gx2/shaders.h>
@@ -16,9 +19,42 @@
 #include <gx2/utils.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifndef GL_UNSIGNED_SHORT_5_6_5
+#define GL_UNSIGNED_SHORT_5_6_5 0x8363
+#endif
+
+#ifndef GL_UNSIGNED_SHORT_5_5_5_1
+#define GL_UNSIGNED_SHORT_5_5_5_1 0x8034
+#endif
+
+#ifndef GL_UNSIGNED_SHORT_4_4_4_4
+#define GL_UNSIGNED_SHORT_4_4_4_4 0x8033
+#endif
+
+#ifndef GL_RGBA4
+#define GL_RGBA4 0x8056
+#endif
+
+#ifndef GL_RGB5_A1
+#define GL_RGB5_A1 0x8057
+#endif
+
+#ifndef GL_RGB565
+#define GL_RGB565 0x8D62
+#endif
+
+#ifndef GL_TEXTURE_CUBE_MAP_POSITIVE_X
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_X 0x8515
+#endif
+
+#ifndef GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
+#define GL_TEXTURE_CUBE_MAP_NEGATIVE_Z 0x851A
 #endif
 
 #define MAX_TEXTURES 2048
@@ -80,31 +116,75 @@ typedef struct {
 
 static GLSampler g_samplers[MAX_SAMPLER_OBJECTS];
 
+#ifndef GX2GL_ENABLE_VERBOSE_FILE_LOGS
+#define GX2GL_ENABLE_VERBOSE_FILE_LOGS 0
+#endif
+
+static void log_texture_step(const char *format, ...) {
+#if GX2GL_ENABLE_VERBOSE_FILE_LOGS
+  char buffer[1024];
+  va_list args;
+  FILE *log_file;
+
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  WiiU_Log("%s", buffer);
+  log_file = fopen(WiiU_GetGX2GLInitLogPath(), "a");
+  if (log_file) {
+    fprintf(log_file, "[gx2gl-texture] %s\n", buffer);
+    fclose(log_file);
+  }
+#else
+  (void)format;
+#endif
+}
+
+static int g_tex_subimage2d_debug_logs = 0;
+
 static uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
 
 static void free_gx2_texture_storage(GX2Texture *texture) {
   if (!texture) {
     return;
   }
+  log_texture_step("free_gx2_texture_storage: begin image=%p mipmaps=%p imageSize=%u mipmapSize=%u",
+                   texture->surface.image, texture->surface.mipmaps,
+                   (unsigned int)texture->surface.imageSize,
+                   (unsigned int)texture->surface.mipmapSize);
   if (texture->surface.image) {
+    log_texture_step("free_gx2_texture_storage: freeing image=%p",
+                     texture->surface.image);
     gl_mem_free(GL_MEM_TYPE_MEM2, texture->surface.image);
     texture->surface.image = NULL;
   }
   if (texture->surface.mipmaps) {
+    log_texture_step("free_gx2_texture_storage: freeing mipmaps=%p",
+                     texture->surface.mipmaps);
     gl_mem_free(GL_MEM_TYPE_MEM2, texture->surface.mipmaps);
     texture->surface.mipmaps = NULL;
   }
+  log_texture_step("free_gx2_texture_storage: done");
 }
 
 static void free_texture_storage(GLTexture *tex) {
   if (!tex || !tex->storage_allocated) {
+    log_texture_step("free_texture_storage: skip tex=%p storage_allocated=%d",
+                     tex, tex && tex->storage_allocated ? 1 : 0);
     return;
   }
+  log_texture_step("free_texture_storage: begin tex=%p image=%p mipmaps=%p internal=0x%X size=%dx%dx%d",
+                   tex, tex->gx2_texture.surface.image,
+                   tex->gx2_texture.surface.mipmaps,
+                   (unsigned int)tex->internal_format, (int)tex->width,
+                   (int)tex->height, (int)tex->depth);
   free_gx2_texture_storage(&tex->gx2_texture);
   memset(&tex->gx2_texture, 0, sizeof(tex->gx2_texture));
   tex->storage_allocated = false;
   tex->complete = false;
   tex->max_level = 0;
+  log_texture_step("free_texture_storage: done tex=%p", tex);
 }
 
 static bool map_dim(GLenum target, GX2SurfaceDim *dim) {
@@ -127,6 +207,15 @@ static bool map_dim(GLenum target, GX2SurfaceDim *dim) {
 static bool is_valid_texture_target(GLenum target) {
   return target == GL_TEXTURE_2D || target == GL_TEXTURE_3D ||
          target == GL_TEXTURE_CUBE_MAP;
+}
+
+static bool is_cube_map_face_target(GLenum target) {
+  return target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
+         target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+}
+
+static uint32_t cube_map_face_index(GLenum target) {
+  return (uint32_t)(target - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
 }
 
 static GX2TexXYFilterMode map_xy_filter(GLenum filter) {
@@ -289,6 +378,25 @@ static bool get_texture_format_info(GLint internalformat, GLenum format,
   case 3:
   case GL_RGB:
   case GL_RGB8:
+    if (type == GL_UNSIGNED_SHORT_5_6_5) {
+      info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R5_G6_B5;
+      info->surface_use =
+          (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+      info->comp_map =
+          GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+      info->src_components = 1;
+      info->dst_components = 1;
+      info->bytes_per_component = 2;
+      info->src_bytes_per_texel = 2;
+      info->dst_bytes_per_texel = 2;
+      info->mipmap_supported = true;
+      if (validate_upload &&
+          (format != GL_RGB || type != GL_UNSIGNED_SHORT_5_6_5)) {
+        return false;
+      }
+      return true;
+    }
+
     info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     info->surface_use =
         (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
@@ -308,6 +416,44 @@ static bool get_texture_format_info(GLint internalformat, GLenum format,
   case 4:
   case GL_RGBA:
   case GL_RGBA8:
+    if (type == GL_UNSIGNED_SHORT_4_4_4_4) {
+      info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R4_G4_B4_A4;
+      info->surface_use =
+          (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+      info->comp_map =
+          GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+      info->src_components = 1;
+      info->dst_components = 1;
+      info->bytes_per_component = 2;
+      info->src_bytes_per_texel = 2;
+      info->dst_bytes_per_texel = 2;
+      info->mipmap_supported = true;
+      if (validate_upload &&
+          (format != GL_RGBA || type != GL_UNSIGNED_SHORT_4_4_4_4)) {
+        return false;
+      }
+      return true;
+    }
+
+    if (type == GL_UNSIGNED_SHORT_5_5_5_1) {
+      info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R5_G5_B5_A1;
+      info->surface_use =
+          (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+      info->comp_map =
+          GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+      info->src_components = 1;
+      info->dst_components = 1;
+      info->bytes_per_component = 2;
+      info->src_bytes_per_texel = 2;
+      info->dst_bytes_per_texel = 2;
+      info->mipmap_supported = true;
+      if (validate_upload &&
+          (format != GL_RGBA || type != GL_UNSIGNED_SHORT_5_5_5_1)) {
+        return false;
+      }
+      return true;
+    }
+
     info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     info->surface_use =
         (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
@@ -321,6 +467,57 @@ static bool get_texture_format_info(GLint internalformat, GLenum format,
     info->mipmap_supported = true;
     if (validate_upload &&
         (format != GL_RGBA || type != GL_UNSIGNED_BYTE)) {
+      return false;
+    }
+    return true;
+  case GL_RGBA4:
+    info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R4_G4_B4_A4;
+    info->surface_use =
+        (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    info->comp_map =
+        GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    info->src_components = 1;
+    info->dst_components = 1;
+    info->bytes_per_component = 2;
+    info->src_bytes_per_texel = 2;
+    info->dst_bytes_per_texel = 2;
+    info->mipmap_supported = true;
+    if (validate_upload &&
+        (format != GL_RGBA || type != GL_UNSIGNED_SHORT_4_4_4_4)) {
+      return false;
+    }
+    return true;
+  case GL_RGB5_A1:
+    info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R5_G5_B5_A1;
+    info->surface_use =
+        (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    info->comp_map =
+        GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    info->src_components = 1;
+    info->dst_components = 1;
+    info->bytes_per_component = 2;
+    info->src_bytes_per_texel = 2;
+    info->dst_bytes_per_texel = 2;
+    info->mipmap_supported = true;
+    if (validate_upload &&
+        (format != GL_RGBA || type != GL_UNSIGNED_SHORT_5_5_5_1)) {
+      return false;
+    }
+    return true;
+  case GL_RGB565:
+    info->gx2_format = GX2_SURFACE_FORMAT_UNORM_R5_G6_B5;
+    info->surface_use =
+        (GX2SurfaceUse)(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    info->comp_map =
+        GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    info->src_components = 1;
+    info->dst_components = 1;
+    info->bytes_per_component = 2;
+    info->src_bytes_per_texel = 2;
+    info->dst_bytes_per_texel = 2;
+    info->mipmap_supported = true;
+    if (validate_upload &&
+        (format != GL_RGB || type != GL_UNSIGNED_SHORT_5_6_5)) {
       return false;
     }
     return true;
@@ -497,8 +694,15 @@ static bool rebuild_texture_storage(GLTexture *tex, GLsizei width,
   if (!get_texture_format_info(internalformat, GL_RGBA, GL_UNSIGNED_BYTE, false,
                                &info) ||
       !map_dim(tex->target, &dim)) {
+    log_texture_step("rebuild_texture_storage: format lookup failed internal=0x%X target=0x%X",
+                     (unsigned int)internalformat, (unsigned int)tex->target);
     return false;
   }
+
+  log_texture_step("rebuild_texture_storage: begin target=0x%X internal=0x%X size=%dx%dx%d mips=%u gx2fmt=0x%X preserve=%d",
+                   (unsigned int)tex->target, (unsigned int)internalformat,
+                   (int)width, (int)height, (int)depth, (unsigned int)mip_levels,
+                   (unsigned int)info.gx2_format, preserve_existing ? 1 : 0);
 
   memset(&new_texture, 0, sizeof(new_texture));
   new_texture.surface.dim = dim;
@@ -514,30 +718,52 @@ static bool rebuild_texture_storage(GLTexture *tex, GLsizei width,
   new_texture.viewFirstSlice = 0;
   new_texture.viewNumSlices = (dim == GX2_SURFACE_DIM_TEXTURE_3D)
                                   ? (uint32_t)depth
-                                  : 1;
+                                  : (dim == GX2_SURFACE_DIM_TEXTURE_CUBE)
+                                        ? 6u
+                                        : 1u;
   new_texture.compMap = info.comp_map;
 
+  log_texture_step("rebuild_texture_storage: before GX2CalcSurfaceSizeAndAlignment");
   GX2CalcSurfaceSizeAndAlignment(&new_texture.surface);
+  log_texture_step("rebuild_texture_storage: after calc imageSize=%u mipmapSize=%u alignment=%u pitch=%u",
+                   (unsigned int)new_texture.surface.imageSize,
+                   (unsigned int)new_texture.surface.mipmapSize,
+                   (unsigned int)new_texture.surface.alignment,
+                   (unsigned int)new_texture.surface.pitch);
 
   if (new_texture.surface.imageSize > 0) {
+    log_texture_step("rebuild_texture_storage: allocating image bytes=%u align=%u",
+                     (unsigned int)new_texture.surface.imageSize,
+                     (unsigned int)new_texture.surface.alignment);
     new_texture.surface.image =
         gl_mem_alloc(GL_MEM_TYPE_MEM2, new_texture.surface.imageSize,
                      new_texture.surface.alignment);
     if (!new_texture.surface.image) {
+      log_texture_step("rebuild_texture_storage: image allocation failed");
       return false;
     }
+    log_texture_step("rebuild_texture_storage: image allocation ok ptr=%p",
+                     new_texture.surface.image);
     memset(new_texture.surface.image, 0, new_texture.surface.imageSize);
+    log_texture_step("rebuild_texture_storage: image cleared");
   }
 
   if (new_texture.surface.mipmapSize > 0) {
+    log_texture_step("rebuild_texture_storage: allocating mipmaps bytes=%u align=%u",
+                     (unsigned int)new_texture.surface.mipmapSize,
+                     (unsigned int)new_texture.surface.alignment);
     new_texture.surface.mipmaps =
         gl_mem_alloc(GL_MEM_TYPE_MEM2, new_texture.surface.mipmapSize,
                      new_texture.surface.alignment);
     if (!new_texture.surface.mipmaps) {
+      log_texture_step("rebuild_texture_storage: mip allocation failed");
       free_gx2_texture_storage(&new_texture);
       return false;
     }
+    log_texture_step("rebuild_texture_storage: mip allocation ok ptr=%p",
+                     new_texture.surface.mipmaps);
     memset(new_texture.surface.mipmaps, 0, new_texture.surface.mipmapSize);
+    log_texture_step("rebuild_texture_storage: mipmaps cleared");
   }
 
   old_texture = tex->gx2_texture;
@@ -562,6 +788,7 @@ static bool rebuild_texture_storage(GLTexture *tex, GLsizei width,
   }
 
   free_texture_storage(tex);
+  log_texture_step("rebuild_texture_storage: previous storage released");
 
   tex->gx2_texture = new_texture;
   tex->storage_allocated = true;
@@ -573,8 +800,11 @@ static bool rebuild_texture_storage(GLTexture *tex, GLsizei width,
   tex->base_level = 0;
   tex->max_level = (GLint)(mip_levels - 1);
 
+  log_texture_step("rebuild_texture_storage: before GX2InitTextureRegs");
   GX2InitTextureRegs(&tex->gx2_texture);
+  log_texture_step("rebuild_texture_storage: after GX2InitTextureRegs");
   gl_framebuffer_mark_texture_dirty((GLuint)(tex - g_textures));
+  log_texture_step("rebuild_texture_storage: success");
   return true;
 }
 
@@ -591,6 +821,16 @@ static void copy_texture_row(uint8_t *dst, const uint8_t *src,
   }
 
   if (info->bytes_per_component == 1) {
+    if (info->dst_bytes_per_texel == 4 && info->src_bytes_per_texel == 4 &&
+        info->src_components == 4 && info->dst_components == 4) {
+      const uint32_t *src32 = (const uint32_t *)src;
+      uint32_t *dst32 = (uint32_t *)dst;
+      for (uint32_t i = 0; i < texel_count; ++i) {
+        dst32[i] = CPU_TO_GPU_32(src32[i]);
+      }
+      return;
+    }
+
     if (info->src_components == info->dst_components) {
       memcpy(dst, src, texel_count * info->dst_bytes_per_texel);
       return;
@@ -599,10 +839,21 @@ static void copy_texture_row(uint8_t *dst, const uint8_t *src,
     for (uint32_t i = 0; i < texel_count; ++i) {
       const uint8_t *src_texel = src + i * info->src_bytes_per_texel;
       uint8_t *dst_texel = dst + i * info->dst_bytes_per_texel;
-      dst_texel[0] = src_texel[0];
-      dst_texel[1] = src_texel[1];
-      dst_texel[2] = src_texel[2];
-      dst_texel[3] = 0xFF;
+      if (info->dst_bytes_per_texel == 4) {
+        uint8_t rgba[4] = {0, 0, 0, 0xFF};
+        uint32_t packed;
+        if (info->src_bytes_per_texel > 0) rgba[0] = src_texel[0];
+        if (info->src_bytes_per_texel > 1) rgba[1] = src_texel[1];
+        if (info->src_bytes_per_texel > 2) rgba[2] = src_texel[2];
+        packed = ((uint32_t)rgba[0] << 24) |
+                 ((uint32_t)rgba[1] << 16) |
+                 ((uint32_t)rgba[2] << 8) |
+                 (uint32_t)rgba[3];
+        packed = CPU_TO_GPU_32(packed);
+        memcpy(dst_texel, &packed, sizeof(packed));
+      } else {
+        memcpy(dst_texel, src_texel, info->src_bytes_per_texel);
+      }
     }
     return;
   }
@@ -625,6 +876,62 @@ static void copy_texture_row(uint8_t *dst, const uint8_t *src,
       dst32[i] = CPU_TO_GPU_32(src32[i]);
     }
     return;
+  }
+}
+
+static void read_texture_row(uint8_t *dst, const uint8_t *src,
+                             uint32_t texel_count,
+                             const TextureFormatInfo *info) {
+  if (info->packed_u32) {
+    const uint32_t *src32 = (const uint32_t *)src;
+    uint32_t *dst32 = (uint32_t *)dst;
+    for (uint32_t i = 0; i < texel_count; ++i) {
+      dst32[i] = GPU_TO_CPU_32(src32[i]);
+    }
+    return;
+  }
+
+  if (info->bytes_per_component == 1) {
+    if (info->dst_bytes_per_texel == 4 && info->src_bytes_per_texel == 4 &&
+        info->src_components == 4 && info->dst_components == 4) {
+      const uint32_t *src32 = (const uint32_t *)src;
+      uint32_t *dst32 = (uint32_t *)dst;
+      for (uint32_t i = 0; i < texel_count; ++i) {
+        dst32[i] = GPU_TO_CPU_32(src32[i]);
+      }
+      return;
+    }
+
+    if (info->src_components == info->dst_components) {
+      memcpy(dst, src, texel_count * info->src_bytes_per_texel);
+      return;
+    }
+
+    for (uint32_t i = 0; i < texel_count; ++i) {
+      const uint8_t *src_texel = src + i * info->dst_bytes_per_texel;
+      uint8_t *dst_texel = dst + i * info->src_bytes_per_texel;
+      memcpy(dst_texel, src_texel, info->src_bytes_per_texel);
+    }
+    return;
+  }
+
+  if (info->bytes_per_component == 2) {
+    const uint16_t *src16 = (const uint16_t *)src;
+    uint16_t *dst16 = (uint16_t *)dst;
+    uint32_t count = texel_count * info->src_components;
+    for (uint32_t i = 0; i < count; ++i) {
+      dst16[i] = GPU_TO_CPU_16(src16[i]);
+    }
+    return;
+  }
+
+  if (info->bytes_per_component == 4) {
+    const uint32_t *src32 = (const uint32_t *)src;
+    uint32_t *dst32 = (uint32_t *)dst;
+    uint32_t count = texel_count * info->src_components;
+    for (uint32_t i = 0; i < count; ++i) {
+      dst32[i] = GPU_TO_CPU_32(src32[i]);
+    }
   }
 }
 
@@ -663,6 +970,33 @@ static bool get_unpack_layout(const TextureFormatInfo *info, GLsizei width,
   return true;
 }
 
+static bool get_pack_layout(const TextureFormatInfo *info, GLsizei width,
+                            GLsizei height, uint32_t *row_bytes,
+                            uint32_t *image_bytes, size_t *base_offset) {
+  GLint row_length;
+  GLint image_height;
+
+  if (!g_gl_context || !info || !row_bytes || !image_bytes || !base_offset) {
+    return false;
+  }
+
+  row_length = g_gl_context->pack_row_length > 0 ? g_gl_context->pack_row_length
+                                                 : width;
+  image_height = g_gl_context->pack_image_height > 0
+                     ? g_gl_context->pack_image_height
+                     : height;
+
+  *row_bytes = align_transfer_row_bytes(
+      (uint32_t)row_length * info->src_bytes_per_texel,
+      g_gl_context->pack_alignment);
+  *image_bytes = *row_bytes * (uint32_t)image_height;
+  *base_offset =
+      (size_t)g_gl_context->pack_skip_images * (*image_bytes) +
+      (size_t)g_gl_context->pack_skip_rows * (*row_bytes) +
+      (size_t)g_gl_context->pack_skip_pixels * info->src_bytes_per_texel;
+  return true;
+}
+
 static bool upload_texture_level(GLTexture *tex, GLint level, GLsizei width,
                                  GLsizei height, GLsizei depth,
                                  const TextureFormatInfo *info,
@@ -689,8 +1023,6 @@ static bool upload_texture_level(GLTexture *tex, GLint level, GLsizei width,
     return false;
   }
 
-  memset(dst, 0, layout.image_size);
-
   if (!get_unpack_layout(info, width, height, &src_row_bytes, &src_image_bytes,
                          &src_base_offset)) {
     return false;
@@ -702,7 +1034,8 @@ static bool upload_texture_level(GLTexture *tex, GLint level, GLsizei width,
     uint8_t *dst_slice = dst + (uint32_t)z * layout.slice_size;
     const uint8_t *src_slice = src + (size_t)z * src_image_bytes;
     for (GLsizei y = 0; y < height; ++y) {
-      copy_texture_row(dst_slice + (uint32_t)y * dst_row_bytes,
+      uint32_t dst_y = (uint32_t)(height - 1 - y);
+      copy_texture_row(dst_slice + dst_y * dst_row_bytes,
                        src_slice + (size_t)y * src_row_bytes, (uint32_t)width,
                        info);
     }
@@ -757,8 +1090,9 @@ static bool upload_texture_sub_region(GLTexture *tex, GLint level,
     uint8_t *dst_slice = dst + (uint32_t)(zoffset + z) * layout.slice_size;
     const uint8_t *src_slice = src + (size_t)z * src_image_bytes;
     for (GLsizei y = 0; y < height; ++y) {
+      uint32_t dst_y = (uint32_t)(layout.height - 1 - (yoffset + y));
       copy_texture_row(
-          dst_slice + (uint32_t)(yoffset + y) * dst_row_bytes +
+          dst_slice + dst_y * dst_row_bytes +
               (uint32_t)xoffset * info->dst_bytes_per_texel,
           src_slice + (size_t)y * src_row_bytes, (uint32_t)width, info);
     }
@@ -884,7 +1218,11 @@ static bool generate_mipmap_level(GLTexture *tex, uint32_t dst_level,
             encode_gpu_float(dst_texel + c * 4u, sums[c] / sample_count);
           }
         } else {
-          return false;
+          const uint8_t *src_slice = src_base + src_z0 * src_layout.slice_size;
+          const uint8_t *src_row = src_slice + src_y0 * src_row_bytes;
+          const uint8_t *src_texel =
+              src_row + src_x0 * info->dst_bytes_per_texel;
+          memcpy(dst_texel, src_texel, info->dst_bytes_per_texel);
         }
       }
     }
@@ -1192,12 +1530,21 @@ void _gl_BindTexture(GLenum target, GLuint texture) {
   GLuint unit = g_gl_context->active_texture;
   switch (target) {
   case GL_TEXTURE_2D:
+    if (texture > 0) {
+      gl_framebuffer_sync_texture_for_sampling(texture);
+    }
     g_gl_context->bound_texture_2d[unit] = texture;
     break;
   case GL_TEXTURE_3D:
+    if (texture > 0) {
+      gl_framebuffer_sync_texture_for_sampling(texture);
+    }
     g_gl_context->bound_texture_3d[unit] = texture;
     break;
   case GL_TEXTURE_CUBE_MAP:
+    if (texture > 0) {
+      gl_framebuffer_sync_texture_for_sampling(texture);
+    }
     g_gl_context->bound_texture_cube[unit] = texture;
     break;
   default:
@@ -1248,16 +1595,25 @@ void _gl_TexImage2D(GLenum target, GLint level, GLint internalformat,
   TextureFormatInfo info;
   GLsizei expected_width;
   GLsizei expected_height;
+  GLenum bind_target;
+  uint32_t face_index;
 
   if (!g_gl_context) {
     return;
   }
-  if (target != GL_TEXTURE_2D) {
+
+  log_texture_step("_gl_TexImage2D: begin target=0x%X level=%d internal=0x%X size=%dx%d border=%d format=0x%X type=0x%X pixels=%p",
+                   (unsigned int)target, (int)level, (unsigned int)internalformat,
+                   (int)width, (int)height, (int)border, (unsigned int)format,
+                   (unsigned int)type, pixels);
+  if (target != GL_TEXTURE_2D && !is_cube_map_face_target(target)) {
     _gl_set_error(GL_INVALID_ENUM);
     return;
   }
 
-  id = get_bound_tex(target);
+  bind_target = target == GL_TEXTURE_2D ? GL_TEXTURE_2D : GL_TEXTURE_CUBE_MAP;
+  face_index = is_cube_map_face_target(target) ? cube_map_face_index(target) : 0;
+  id = get_bound_tex(bind_target);
   if (!id) {
     _gl_set_error(GL_INVALID_OPERATION);
     return;
@@ -1268,16 +1624,41 @@ void _gl_TexImage2D(GLenum target, GLint level, GLint internalformat,
   }
   if (!get_texture_format_info(internalformat, format, type, pixels != NULL,
                                &info)) {
+    log_texture_step("_gl_TexImage2D: format lookup failed");
     _gl_set_error(GL_INVALID_ENUM);
     return;
   }
 
+  log_texture_step("_gl_TexImage2D: format lookup ok gx2fmt=0x%X srcBytes=%u dstBytes=%u",
+                   (unsigned int)info.gx2_format, (unsigned int)info.src_bytes_per_texel,
+                   (unsigned int)info.dst_bytes_per_texel);
+
   tex = &g_textures[id];
   if (level == 0) {
-    if (!rebuild_texture_storage(tex, width, height, 1, internalformat, 1,
-                                 false)) {
-      _gl_set_error(GL_OUT_OF_MEMORY);
-      return;
+    if (bind_target == GL_TEXTURE_CUBE_MAP) {
+      if (!tex->storage_allocated) {
+        log_texture_step("_gl_TexImage2D: rebuilding cube level 0 storage");
+        if (!rebuild_texture_storage(tex, width, height, 6, internalformat, 1,
+                                     false)) {
+          log_texture_step("_gl_TexImage2D: rebuild failed");
+          _gl_set_error(GL_OUT_OF_MEMORY);
+          return;
+        }
+      } else if (tex->internal_format != internalformat) {
+        _gl_set_error(GL_INVALID_OPERATION);
+        return;
+      } else if (tex->width != width || tex->height != height || tex->depth != 6) {
+        _gl_set_error(GL_INVALID_VALUE);
+        return;
+      }
+    } else {
+      log_texture_step("_gl_TexImage2D: rebuilding level 0 storage");
+      if (!rebuild_texture_storage(tex, width, height, 1, internalformat, 1,
+                                   false)) {
+        log_texture_step("_gl_TexImage2D: rebuild failed");
+        _gl_set_error(GL_OUT_OF_MEMORY);
+        return;
+      }
     }
   } else {
     if (!tex->storage_allocated || tex->internal_format != internalformat) {
@@ -1307,13 +1688,20 @@ void _gl_TexImage2D(GLenum target, GLint level, GLint internalformat,
     }
   }
 
-  if (!upload_texture_level(tex, level, width, height, 1, &info, pixels)) {
+  log_texture_step("_gl_TexImage2D: uploading level data");
+  if ((bind_target == GL_TEXTURE_CUBE_MAP &&
+       !upload_texture_sub_region(tex, level, 0, 0, (GLint)face_index, width,
+                                  height, 1, &info, pixels)) ||
+      (bind_target != GL_TEXTURE_CUBE_MAP &&
+       !upload_texture_level(tex, level, width, height, 1, &info, pixels))) {
+    log_texture_step("_gl_TexImage2D: upload failed");
     _gl_set_error(GL_INVALID_OPERATION);
     return;
   }
 
   tex->complete = true;
   g_gl_context->dirty_flags |= GL_DIRTY_TEXTURE_BINDINGS;
+  log_texture_step("_gl_TexImage2D: success");
 }
 
 void _gl_TexImage3D(GLenum target, GLint level, GLint internalformat,
@@ -1405,6 +1793,14 @@ void _gl_TexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
   GLTexture *tex;
   TextureFormatInfo info;
 
+  if (g_tex_subimage2d_debug_logs < 16) {
+    log_texture_step(
+        "_gl_TexSubImage2D: begin target=0x%X level=%d offset=%d,%d size=%dx%d format=0x%X type=0x%X pixels=%p",
+        (unsigned int)target, (int)level, (int)xoffset, (int)yoffset,
+        (int)width, (int)height, (unsigned int)format, (unsigned int)type,
+        pixels);
+  }
+
   if (!g_gl_context) {
     return;
   }
@@ -1434,16 +1830,38 @@ void _gl_TexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
   }
   if (!get_texture_format_info(tex->internal_format, format, type,
                                pixels != NULL, &info)) {
+    if (g_tex_subimage2d_debug_logs < 16) {
+      log_texture_step(
+          "_gl_TexSubImage2D: format lookup failed internal=0x%X format=0x%X type=0x%X complete=%d storage=%d",
+          (unsigned int)tex->internal_format, (unsigned int)format,
+          (unsigned int)type, tex->complete ? 1 : 0,
+          tex->storage_allocated ? 1 : 0);
+      ++g_tex_subimage2d_debug_logs;
+    }
     _gl_set_error(GL_INVALID_ENUM);
     return;
   }
   if (!upload_texture_sub_region(tex, level, xoffset, yoffset, 0, width,
                                  height, 1, &info, pixels)) {
+    if (g_tex_subimage2d_debug_logs < 16) {
+      log_texture_step(
+          "_gl_TexSubImage2D: upload failed internal=0x%X gx2fmt=0x%X offset=%d,%d size=%dx%d",
+          (unsigned int)tex->internal_format,
+          (unsigned int)tex->gx2_texture.surface.format, (int)xoffset,
+          (int)yoffset, (int)width, (int)height);
+      ++g_tex_subimage2d_debug_logs;
+    }
     _gl_set_error(pixels ? GL_INVALID_VALUE : GL_INVALID_OPERATION);
     return;
   }
 
   g_gl_context->dirty_flags |= GL_DIRTY_TEXTURE_BINDINGS;
+  if (g_tex_subimage2d_debug_logs < 16) {
+    log_texture_step("_gl_TexSubImage2D: success internal=0x%X gx2fmt=0x%X",
+                     (unsigned int)tex->internal_format,
+                     (unsigned int)tex->gx2_texture.surface.format);
+    ++g_tex_subimage2d_debug_logs;
+  }
 }
 
 void _gl_TexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
@@ -1519,7 +1937,7 @@ void _gl_CopyTexImage2D(GLenum target, GLint level, GLenum internalformat,
     _gl_set_error(GL_INVALID_OPERATION);
     return;
   }
-  if (level < 0 || x < 0 || y < 0 || width < 0 || height < 0 || border != 0) {
+  if (level < 0 || width < 0 || height < 0 || border != 0) {
     _gl_set_error(GL_INVALID_VALUE);
     return;
   }
@@ -1613,8 +2031,7 @@ void _gl_CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset,
     _gl_set_error(GL_INVALID_OPERATION);
     return;
   }
-  if (level < 0 || xoffset < 0 || yoffset < 0 || x < 0 || y < 0 ||
-      width < 0 || height < 0) {
+  if (level < 0 || xoffset < 0 || yoffset < 0 || width < 0 || height < 0) {
     _gl_set_error(GL_INVALID_VALUE);
     return;
   }
@@ -1772,14 +2189,7 @@ void _gl_TexParameteri(GLenum target, GLenum pname, GLint param) {
 }
 
 void _gl_TexParameterf(GLenum target, GLenum pname, GLfloat param) {
-  GLint value = (GLint)param;
-
-  if ((GLfloat)value != param) {
-    _gl_set_error(GL_INVALID_VALUE);
-    return;
-  }
-
-  _gl_TexParameteri(target, pname, value);
+  _gl_TexParameteri(target, pname, (GLint)param);
 }
 
 void _gl_TexParameteriv(GLenum target, GLenum pname, const GLint *params) {
@@ -1839,19 +2249,6 @@ void _gl_GetTexParameteriv(GLenum target, GLenum pname, GLint *params) {
   }
 }
 
-void _gl_TexParameterIiv(GLenum target, GLenum pname, const GLint *params) {
-  if (params) _gl_TexParameteri(target, pname, params[0]);
-}
-void _gl_TexParameterIuiv(GLenum target, GLenum pname, const GLuint *params) {
-  if (params) _gl_TexParameteri(target, pname, (GLint)params[0]);
-}
-void _gl_GetTexParameterIiv(GLenum target, GLenum pname, GLint *params) {
-  _gl_GetTexParameteriv(target, pname, params);
-}
-void _gl_GetTexParameterIuiv(GLenum target, GLenum pname, GLuint *params) {
-  GLint v = 0; _gl_GetTexParameteriv(target, pname, &v); if (params) *params = (GLuint)v;
-}
-
 void _gl_GetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) {
   GLuint id;
   GLTexture *tex;
@@ -1894,15 +2291,11 @@ void _gl_GetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) {
 }
 
 void _gl_SamplerParameteriv(GLuint sampler, GLenum pname, const GLint *param) {
-  if (!param) return;
-  _gl_SamplerParameteri(sampler, pname, param[0]);
-}
+  if (!param) {
+    return;
+  }
 
-void _gl_SamplerParameterIiv(GLuint sampler, GLenum pname, const GLint *param) {
-  if (param) _gl_SamplerParameteri(sampler, pname, param[0]);
-}
-void _gl_SamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint *param) {
-  if (param) _gl_SamplerParameteri(sampler, pname, (GLint)param[0]);
+  _gl_SamplerParameteri(sampler, pname, param[0]);
 }
 
 void _gl_SamplerParameterfv(GLuint sampler, GLenum pname,
@@ -1937,14 +2330,7 @@ void _gl_SamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
 }
 
 void _gl_SamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {
-  GLint value = (GLint)param;
-
-  if ((GLfloat)value != param) {
-    _gl_set_error(GL_INVALID_VALUE);
-    return;
-  }
-
-  _gl_SamplerParameteri(sampler, pname, value);
+  _gl_SamplerParameteri(sampler, pname, (GLint)param);
 }
 
 void _gl_GetSamplerParameteriv(GLuint sampler, GLenum pname, GLint *params) {
@@ -1977,13 +2363,6 @@ void _gl_GetSamplerParameteriv(GLuint sampler, GLenum pname, GLint *params) {
     _gl_set_error(GL_INVALID_ENUM);
     break;
   }
-}
-
-void _gl_GetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params) {
-  _gl_GetSamplerParameteriv(sampler, pname, params);
-}
-void _gl_GetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params) {
-  GLint v = 0; _gl_GetSamplerParameteriv(sampler, pname, &v); if (params) *params = (GLuint)v;
 }
 
 void _gl_GetSamplerParameterfv(GLuint sampler, GLenum pname, GLfloat *params) {
@@ -2072,11 +2451,20 @@ void _gl_CompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset,
 }
 
 void _gl_GetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params) {
+    GLuint id;
+    GLTexture *tex;
     if (!g_gl_context || !params) return;
+    if (!is_valid_texture_target(target)) { _gl_set_error(GL_INVALID_ENUM); return; }
+    id = get_bound_tex(target);
+    if (!id) { _gl_set_error(GL_INVALID_OPERATION); return; }
+    tex = &g_textures[id];
+    if (!tex->storage_allocated) { *params = 0; return; }
+    GLsizei w = level < 32 ? (tex->width  >> level) : 0; if (w < 1) w = 1;
+    GLsizei h = level < 32 ? (tex->height >> level) : 0; if (h < 1) h = 1;
     switch (pname) {
-        case GL_TEXTURE_WIDTH: *params = 0; break;
-        case GL_TEXTURE_HEIGHT: *params = 0; break;
-        case GL_TEXTURE_INTERNAL_FORMAT: *params = GL_RGBA8; break;
+        case GL_TEXTURE_WIDTH:           *params = (GLint)w; break;
+        case GL_TEXTURE_HEIGHT:          *params = (GLint)h; break;
+        case GL_TEXTURE_INTERNAL_FORMAT: *params = tex->internal_format; break;
         default: _gl_set_error(GL_INVALID_ENUM); break;
     }
 }
@@ -2085,6 +2473,107 @@ void _gl_GetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloa
     GLint iparams;
     _gl_GetTexLevelParameteriv(target, level, pname, &iparams);
     if (params) *params = (GLfloat)iparams;
+}
+
+void _gl_GetTexImage(GLenum target, GLint level, GLenum format, GLenum type,
+                     GLvoid *pixels) {
+  GLuint id;
+  GLTexture *tex;
+  TextureFormatInfo info;
+  TextureLevelLayout layout;
+  uint8_t *src_level;
+  uint8_t *dst_base;
+  uint32_t dst_row_bytes;
+  uint32_t dst_image_bytes;
+  uint32_t src_row_bytes;
+  uint32_t start_slice = 0;
+  uint32_t slice_count = 1;
+  size_t dst_base_offset;
+
+  if (!g_gl_context) {
+    return;
+  }
+  if (!pixels) {
+    _gl_set_error(GL_INVALID_OPERATION);
+    return;
+  }
+
+  if (target == GL_TEXTURE_2D || target == GL_TEXTURE_3D) {
+    id = get_bound_tex(target);
+  } else if (is_cube_map_face_target(target)) {
+    id = get_bound_tex(GL_TEXTURE_CUBE_MAP);
+    start_slice = cube_map_face_index(target);
+  } else {
+    _gl_set_error(GL_INVALID_ENUM);
+    return;
+  }
+
+  if (!id || id >= MAX_TEXTURES || !g_textures[id].in_use) {
+    _gl_set_error(GL_INVALID_OPERATION);
+    return;
+  }
+
+  tex = &g_textures[id];
+  if (!tex->complete || !tex->storage_allocated) {
+    _gl_set_error(GL_INVALID_OPERATION);
+    return;
+  }
+  if (level < 0 || (uint32_t)level >= tex->gx2_texture.surface.mipLevels) {
+    _gl_set_error(GL_INVALID_VALUE);
+    return;
+  }
+  if (is_cube_map_face_target(target) && tex->target != GL_TEXTURE_CUBE_MAP) {
+    _gl_set_error(GL_INVALID_OPERATION);
+    return;
+  }
+  if (!get_texture_format_info(tex->internal_format, format, type, true,
+                               &info)) {
+    /* gx2gl currently supports readback only for the texture's native upload
+     * format/type pair, not arbitrary GL conversion targets. */
+    _gl_set_error(GL_INVALID_OPERATION);
+    return;
+  }
+  if (!calc_level_layout(tex->target, tex->gx2_texture.surface.format,
+                         tex->width, tex->height, tex->depth, (uint32_t)level,
+                         &layout) ||
+      !get_pack_layout(&info, layout.width, layout.height, &dst_row_bytes,
+                       &dst_image_bytes, &dst_base_offset)) {
+    _gl_set_error(GL_INVALID_OPERATION);
+    return;
+  }
+
+  if (target == GL_TEXTURE_3D) {
+    slice_count = (uint32_t)layout.depth;
+  } else if (is_cube_map_face_target(target)) {
+    if (start_slice >= (uint32_t)layout.depth) {
+      _gl_set_error(GL_INVALID_OPERATION);
+      return;
+    }
+    slice_count = 1;
+  }
+
+  src_level = get_texture_level_ptr(tex, (uint32_t)level);
+  if (!src_level) {
+    _gl_set_error(GL_INVALID_OPERATION);
+    return;
+  }
+
+  gl_framebuffer_sync_texture_for_sampling(id);
+  GX2DrawDone();
+  DCInvalidateRange(src_level, layout.image_size);
+
+  dst_base = (uint8_t *)pixels + dst_base_offset;
+  src_row_bytes = layout.pitch * info.dst_bytes_per_texel;
+  for (uint32_t z = 0; z < slice_count; ++z) {
+    const uint8_t *src_slice =
+        src_level + (start_slice + z) * layout.slice_size;
+    uint8_t *dst_slice = dst_base + (size_t)z * dst_image_bytes;
+    for (GLsizei y = 0; y < layout.height; ++y) {
+      read_texture_row(dst_slice + (size_t)y * dst_row_bytes,
+                       src_slice + (size_t)y * src_row_bytes,
+                       (uint32_t)layout.width, &info);
+    }
+  }
 }
 
 void _gl_GenerateMipmap(GLenum target) {
@@ -2141,7 +2630,7 @@ void _gl_GenerateMipmap(GLenum target) {
 }
 
 void gl_bind_textures(void) {
-
+  gl_bind_program_textures();
 }
 
 GX2Texture *gl_get_gx2_texture(GLuint id) {

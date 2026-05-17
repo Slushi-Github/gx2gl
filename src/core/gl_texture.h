@@ -37,22 +37,13 @@ void _gl_TexParameteriv(GLenum target, GLenum pname, const GLint *params);
 void _gl_TexParameterfv(GLenum target, GLenum pname, const GLfloat *params);
 void _gl_GetTexParameteriv(GLenum target, GLenum pname, GLint *params);
 void _gl_GetTexParameterfv(GLenum target, GLenum pname, GLfloat *params);
-void _gl_TexParameterIiv(GLenum target, GLenum pname, const GLint *params);
-void _gl_TexParameterIuiv(GLenum target, GLenum pname, const GLuint *params);
-void _gl_GetTexParameterIiv(GLenum target, GLenum pname, GLint *params);
-void _gl_GetTexParameterIuiv(GLenum target, GLenum pname, GLuint *params);
 void _gl_SamplerParameteriv(GLuint sampler, GLenum pname, const GLint *param);
 void _gl_SamplerParameterfv(GLuint sampler, GLenum pname, const GLfloat *param);
 void _gl_SamplerParameteri(GLuint sampler, GLenum pname, GLint param);
 void _gl_SamplerParameterf(GLuint sampler, GLenum pname, GLfloat param);
-void _gl_SamplerParameterIiv(GLuint sampler, GLenum pname, const GLint *param);
-void _gl_SamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint *param);
 void _gl_GetSamplerParameteriv(GLuint sampler, GLenum pname, GLint *params);
 void _gl_GetSamplerParameterfv(GLuint sampler, GLenum pname, GLfloat *params);
-void _gl_GetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params);
-void _gl_GetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params);
 void _gl_GenerateMipmap(GLenum target);
-
 
 void _gl_TexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid *pixels);
 void _gl_TexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid *pixels);
@@ -65,9 +56,12 @@ void _gl_CompressedTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsi
 void _gl_CompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const GLvoid *data);
 void _gl_GetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params);
 void _gl_GetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat *params);
+void _gl_GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *pixels);
 
 void gl_bind_textures(void);
 
+GX2Texture *gl_get_gx2_texture(GLuint id);
+GLint gl_get_texture_internal_format(GLuint id);
 GX2Sampler *gl_get_gx2_sampler(GLuint id, bool use_sampler_obj);
 
 #ifdef __cplusplus
