@@ -10,7 +10,9 @@ CafeGLSL: https://github.com/Exzap/CafeGLSL
 
 wut: https://github.com/devkitPro/wut/
 
-"Because ANGLE wasn't enough." - siahisaforker, February 12, 2026  -# even though angle is something completely different anyway..
+"Because ANGLE wasn't enough." - siahisaforker, February 12, 2026  
+
+-# even though angle is something completely different anyway..
 
 # Please read!!
 
