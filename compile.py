@@ -111,7 +111,7 @@ def main():
     # Compile
     print("Compiling...")
     cores = str(multiprocessing.cpu_count())
-    build_cmd = ["cmake", "--build", build_dir, "--parallel", cores, "--target", "gx2vk_test"]
+    build_cmd = ["cmake", "--build", build_dir, "--parallel", cores, "--target", "gl33_gx2_core"]
     result = subprocess.run(build_cmd)
     if result.returncode != 0:
         print("Build FAILED during compilation.")
