@@ -23,6 +23,8 @@ set(SOURCES
     src/core/gl_shader.cpp
     src/core/gx2gl_cafeglsl.cpp
     src/core/gx2gl_shader_compat.cpp
+    src/core/gx2gl_sdl_bridge.cpp
+    src/core/gx2gl_proc.cpp
     src/core/gl_vao.cpp
     src/core/gl_framebuffer.cpp
     src/core/gl_draw.cpp
