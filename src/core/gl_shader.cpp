@@ -2752,7 +2752,7 @@ void gl_shader_shutdown(void) {
   g_shader_mode_valid = false;
   g_shader_mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
 
-  if (g_uniform_ring) {
+  if (g_uniform_ring) { 
     gl_mem_free(GL_MEM_TYPE_MEM2, g_uniform_ring);
     g_uniform_ring = NULL;
     g_uniform_ring_head = 0;
