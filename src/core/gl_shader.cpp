@@ -2249,6 +2249,31 @@ static bool bind_uniform_block_buffer(GLuint buffer_id, uint32_t offset, uint32_
   return true;
 }
 
+#define GX2GL_UNIFORM_RING_SIZE (2u * 1024u * 1024u)
+static uint8_t *g_uniform_ring = NULL;
+static uint32_t g_uniform_ring_head = 0;
+
+static void *uniform_ring_snapshot(const void *src, uint32_t size) {
+  if (!src || size == 0) return NULL;
+  uint32_t aligned = (size + 255u) & ~255u;
+  if (aligned > GX2GL_UNIFORM_RING_SIZE) return NULL;
+
+  if (!g_uniform_ring) {
+    g_uniform_ring = (uint8_t *)gl_mem_alloc(GL_MEM_TYPE_MEM2,
+                                             GX2GL_UNIFORM_RING_SIZE, 256);
+    if (!g_uniform_ring) return NULL;
+    memset(g_uniform_ring, 0, GX2GL_UNIFORM_RING_SIZE);
+  }
+  if (g_uniform_ring_head + aligned > GX2GL_UNIFORM_RING_SIZE)
+    g_uniform_ring_head = 0;
+
+  uint8_t *dst = g_uniform_ring + g_uniform_ring_head;
+  g_uniform_ring_head += aligned;
+  memcpy(dst, src, size);
+  DCFlushRange(dst, aligned);
+  return dst;
+}
+
 static void bind_program_uniform_blocks(GLProgram *prog) {
   if (!g_gl_context || !prog) return;
 
@@ -2299,29 +2324,31 @@ static void bind_program_uniform_blocks(GLProgram *prog) {
     }
   }
 
-  if (stage_uses_virtual_uniform_block(prog, false) &&
+    if (stage_uses_virtual_uniform_block(prog, false) &&
       prog->vs_direct_uniform_shadow &&
       prog->vs_direct_uniform_shadow_size > 0) {
-    DCFlushRange(prog->vs_direct_uniform_shadow,
-                 prog->vs_direct_uniform_shadow_size);
-    GX2Invalidate(GX2_INVALIDATE_MODE_UNIFORM_BLOCK,
-                  prog->vs_direct_uniform_shadow,
-                  prog->vs_direct_uniform_shadow_size);
+    uint32_t size = prog->vs_direct_uniform_shadow_size;
+    void *data = uniform_ring_snapshot(prog->vs_direct_uniform_shadow, size);
+    if (!data) {
+      data = prog->vs_direct_uniform_shadow;
+      DCFlushRange(data, size);
+    }
+    GX2Invalidate(GX2_INVALIDATE_MODE_UNIFORM_BLOCK, data, size);
     GX2SetVertexUniformBlock(GX2GL_CAFEGLSL_VIRTUAL_UNIFORM_BLOCK_LOCATION,
-                             prog->vs_direct_uniform_shadow_size,
-                             prog->vs_direct_uniform_shadow);
+                             size, data);
   }
   if (stage_uses_virtual_uniform_block(prog, true) &&
       prog->ps_direct_uniform_shadow &&
       prog->ps_direct_uniform_shadow_size > 0) {
-    DCFlushRange(prog->ps_direct_uniform_shadow,
-                 prog->ps_direct_uniform_shadow_size);
-    GX2Invalidate(GX2_INVALIDATE_MODE_UNIFORM_BLOCK,
-                  prog->ps_direct_uniform_shadow,
-                  prog->ps_direct_uniform_shadow_size);
+    uint32_t size = prog->ps_direct_uniform_shadow_size;
+    void *data = uniform_ring_snapshot(prog->ps_direct_uniform_shadow, size);
+    if (!data) {
+      data = prog->ps_direct_uniform_shadow;
+      DCFlushRange(data, size);
+    }
+    GX2Invalidate(GX2_INVALIDATE_MODE_UNIFORM_BLOCK, data, size);
     GX2SetPixelUniformBlock(GX2GL_CAFEGLSL_VIRTUAL_UNIFORM_BLOCK_LOCATION,
-                            prog->ps_direct_uniform_shadow_size,
-                            prog->ps_direct_uniform_shadow);
+                            size, data);
   }
 }
 
@@ -2721,10 +2748,19 @@ void gl_shader_shutdown(void) {
   }
   memset(g_programs, 0, sizeof(g_programs));
   memset(g_shaders, 0, sizeof(g_shaders));
+
   g_shader_mode_valid = false;
   g_shader_mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
+
+  if (g_uniform_ring) { 
+    gl_mem_free(GL_MEM_TYPE_MEM2, g_uniform_ring);
+    g_uniform_ring = NULL;
+    g_uniform_ring_head = 0;
+  }
+
   gx2gl_cafeglsl_shutdown();
 }
+
 GLuint _gl_CreateShader(GLenum type) {
   if (!is_supported_shader_type(type)) {
     _gl_set_error(GL_INVALID_ENUM);
